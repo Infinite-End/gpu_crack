@@ -1,13 +1,20 @@
 # gpu_crack — GPU 批量爆破 / 校验工具箱
 
+> English: a GPU-accelerated CTF toolkit for batch brute-force and triage — MT19937 seed scan, AES S-box
+> fault scan, ChaCha20/RC4/AES-CTR keystream, RS(63,31), TEA/Speck, LCG recovery, MD5 cracking,
+> RSA multi-attack, multi-layer decoding, image LSB/stegscan, ROP gadgets and ELF recon.
+> Command-line only, backend auto-select (torch CUDA → CPU → numpy). Docs are in Chinese; see
+> `CLI_REFERENCE.md` for every flag and exit code. Licensed MIT.
+
 | 文档属性 | 值 |
 |---|---|
 | 文档版本 | v2.1（2026-11-01） |
 | 工具版本 | gpu_crack toolkit v2 |
 | 校验状态 | `ctf.py selftest` 全 PASS；`consistency.py` 32/32；文档驱动验收 129/129 |
 | 适用环境 | Windows + Python 3.15 + torch 2.14.1+cu130（无 torch 时自动回退 numpy） |
-| GitHub | https://github.com/Infinite-End/gpu_crack（private，tag `v2.1`） |
+| GitHub | https://github.com/Infinite-End/gpu_crack（**public / MIT**，tag `v2.1`） |
 | 配套文档 | [CLI_REFERENCE.md](CLI_REFERENCE.md)（**参数/输出/退出码以它为准**）、`skill/SKILL.md` 与 `skill/references/kernels.md` |
+| 许可证 | [MIT](LICENSE) |
 
 ---
 
@@ -251,10 +258,16 @@ E:\gpu_crack\
 
 ## 13. GitHub 仓库与跨机使用
 
-- 仓库：https://github.com/Infinite-End/gpu_crack （private），标签 `v2.1`。
+- 仓库：https://github.com/Infinite-End/gpu_crack （**public / 开源**），标签 `v2.1`。
 - 仓库根目录 = 本目录。`skill/` 是 DSH skill 定义（`SKILL.md` / `references/kernels.md` / `scripts/ctf.py`）的**同步副本**；
   修改 skill 源后需同步到 `skill/`，`doc_lint.py` 会校验镜像一致性。
 - 在其它机器/其它模型上使用：
   1. `git clone` 后设置 `CTF_TOOLKIT_DIR=<仓库根目录>`；
   2. 设置 `CTF_PYTHON=<本地带 torch 的解释器>`（没有 GPU/torch 时用 `--backend numpy` 也可正确运行）；
   3. 跑 `python -X utf8 doc_lint.py`（有 repo 内 `skill/` 时自动用镜像）与 `python -X utf8 consistency.py` 确认环境。
+
+## 14. 许可证
+
+本项目以 **MIT License** 开源（见 [LICENSE](LICENSE)）。可自由使用、修改、分发、再许可与商用，
+保留版权声明与许可声明即可。第三方依赖（torch/numpy/Pillow/capstone/pycryptodome/cryptography）遵循各自许可证。
+
