@@ -1,6 +1,6 @@
 ---
 name: ctf-toolkit
-description: GPU-accelerated, command-line CTF toolkit at E:\gpu_crack for batch brute-force and triage (MT19937 seed scan, AES S-box fault scan, ChaCha20/RC4/AES-CTR keystream, RS(63,31) syndrome, TEA/XTEA/XXTEA/Speck, LCG recovery, MD5 cracking, RSA multi-attack, multi-layer decoding, image LSB/stegscan, image diff, ROP gadgets, ELF recon, cyclic offsets). Use when a CTF task requires trying many candidates at once, identifying an unknown cipher, recovering keys/keystreams, extracting hidden data from images or files, or computing pwn offsets and gadgets.
+description: GPU-accelerated, command-line CTF toolkit in this repository for batch brute-force and triage (MT19937 seed scan, AES S-box fault scan, ChaCha20/RC4/AES-CTR keystream, RS(63,31) syndrome, TEA/XTEA/XXTEA/Speck, LCG recovery, MD5 cracking, RSA multi-attack, multi-layer decoding, image LSB/stegscan, image diff, ROP gadgets, ELF recon, cyclic offsets). Use when a CTF task requires trying many candidates at once, identifying an unknown cipher, recovering keys/keystreams, extracting hidden data from images or files, or computing pwn offsets and gadgets.
 ---
 
 # CTF Toolkit（gpu_crack）使用规范
@@ -8,29 +8,29 @@ description: GPU-accelerated, command-line CTF toolkit at E:\gpu_crack for batch
 | 文档属性 | 值 |
 |---|---|
 | 文档版本 | v2.1（2026-11-01） |
-| 适用工具 | gpu_crack toolkit v2（`E:\gpu_crack`） |
+| 适用工具 | gpu_crack toolkit v2（仓库根目录） |
 | 校验状态 | `ctf.py selftest` 全 PASS；`consistency.py` 32/32 |
-| 配套文档 | `E:\gpu_crack\CLI_REFERENCE.md`（规范性参数/输出/退出码）、`E:\gpu_crack\README.md`、`references/kernels.md` |
+| 配套文档 | `CLI_REFERENCE.md`（仓库根，规范性参数/输出/退出码）、`README.md`（仓库根）、`references/kernels.md` |
 
 本 skill 是**可被任意模型复用**的操作规范。所有事实以仓库文档为准，不要凭记忆猜参数：
-命令行细节查 `E:\gpu_crack\CLI_REFERENCE.md`，项目说明查 `E:\gpu_crack\README.md`。
+命令行细节查仓库根的 `CLI_REFERENCE.md`，项目说明查 `README.md`。
 
 ## 1. 固定事实（先读，别猜）
 
 | 项 | 值 |
 |---|---|
-| 工具箱目录 | `E:\gpu_crack`（可用 `CTF_TOOLKIT_DIR` 覆盖） |
-| GPU 解释器 | `C:\Users\<user>\AppData\Local\Programs\Python\Python315\python.exe`（Python 3.15 + torch 2.14.1+cu130） |
+| 工具箱目录 | 仓库根目录（`ctf.py` 向上两级；可用 `CTF_TOOLKIT_DIR` 覆盖） |
+| GPU 解释器 | PATH 上的 `python3` / `python`（需 torch + CUDA；也可用 `CTF_PYTHON` 强制指定） |
 | 解释器覆盖 | 环境变量 `CTF_PYTHON`（设置且存在时优先） |
-| 统一入口 | `C:\Users\<user>\skills\ctf-toolkit\scripts\ctf.py` |
-| 参考文档 | `<skill>/references/kernels.md`（一页速查）、`E:\gpu_crack\CLI_REFERENCE.md`（完整参数/输出/退出码） |
+| 统一入口 | `scripts/ctf.py`（本 skill 内） |
+| 参考文档 | `<skill>/references/kernels.md`（一页速查）、`CLI_REFERENCE.md`（完整参数/输出/退出码） |
 | 后端 | `--backend auto|torch|numpy`；`ctf_misc.py` 纯 CPU，无此参数 |
 | 分块 | `--chunk N`（gpu_crack 默认 65536、ctf_tools 默认 16384；OOM 时减半） |
 
 统一入口会自动挑解释器、把全局参数挪到正确位置。不确定时**优先用统一入口**：
 
 ```powershell
-$ctf = 'C:\Users\<user>\skills\ctf-toolkit\scripts\ctf.py'
+$ctf = '.\scripts\ctf.py'
 python $ctf selftest          # 四模块组合自测；全 PASS 且退出码 0 才继续
 ```
 
@@ -38,7 +38,7 @@ python $ctf selftest          # 四模块组合自测；全 PASS 且退出码 0 
 
 ```powershell
 # 1) 工具箱与解释器可用？
-& 'C:\Users\<user>\AppData\Local\Programs\Python\Python315\python.exe' -c "import torch;print(torch.__version__, torch.cuda.is_available())"
+& python -c "import torch;print(torch.__version__, torch.cuda.is_available())"
 # 2) 工具箱自测全绿？
 python $ctf selftest
 # 3) 目标命令的真实参数（不要凭记忆）：
@@ -129,9 +129,9 @@ python $ctf lsb --img chal.png           # 再看 LSB 候选（score 降序）
 按顺序执行，全绿才允许交付：
 
 ```powershell
-python -X utf8 E:\gpu_crack\ctf_tools.py selftest     # 以及 ctf_ext.py / ctf_misc.py selftest
-python -X utf8 E:\gpu_crack\selftest.py
-python -X utf8 E:\gpu_crack\consistency.py            # 期望: 通过 32/32
+python -X utf8 ctf_tools.py selftest     # 以及 ctf_ext.py / ctf_misc.py selftest
+python -X utf8 selftest.py
+python -X utf8 consistency.py            # 期望: 通过 32/32
 python $ctf selftest                                  # 期望: 四模块全 PASS, 退出码 0
 ```
 
@@ -160,7 +160,7 @@ python $ctf selftest                                  # 期望: 四模块全 PAS
 
 ## 10. 文档索引（优先级从高到低）
 
-1. `E:\gpu_crack\CLI_REFERENCE.md` — 每个子命令的参数表/输出形态/退出码/示例（规范性）
-2. `E:\gpu_crack\README.md` — 项目结构、环境、库 API、性能基线、已知限制
+1. `CLI_REFERENCE.md` — 每个子命令的参数表/输出形态/退出码/示例（规范性）
+2. `README.md` — 项目结构、环境、库 API、性能基线、已知限制
 3. `<skill>/references/kernels.md` — 一页速查（题型 → 内核 → 验证向量 → 吞吐）
 4. 各模块 `--help` — 运行时唯一真值（与 CLI_REFERENCE 同步维护）

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """gpu_crack.py 自测：正确性 + 性能。用 GPU 环境运行。"""
-import sys, time
-sys.path.insert(0, r'E:\gpu_crack')
+import os, sys, time
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import gpu_crack as G
 
 name, dev = G.init_backend('torch')

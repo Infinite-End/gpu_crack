@@ -36,7 +36,7 @@ ctf_ext.py — CTF 算法族内核（与 gpu_crack.py 共用后端）
   python ctf_ext.py rsa    --n <hex> --e 65537 --c <hex>
   python ctf_ext.py encode --data-hex 666c61677b746573747d   (或 --data "flag{test}")
 
-完整参数/输出/退出码见 E:\\gpu_crack\\CLI_REFERENCE.md。
+完整参数/输出/退出码见 CLI_REFERENCE.md。
 """
 
 from __future__ import annotations
@@ -928,7 +928,7 @@ def cmd_encode(a):
 
 def main():
     ap = argparse.ArgumentParser(
-        description='ctf_ext — CTF 算法族内核（完整说明见 E:\\gpu_crack\\CLI_REFERENCE.md）')
+        description='ctf_ext — CTF 算法族内核（完整说明见 CLI_REFERENCE.md）')
     ap.add_argument('--backend', default='auto', choices=['auto', 'torch', 'numpy'],
                     help='计算后端：auto=torch-cuda→torch-cpu→numpy（默认 auto）')
     sub = ap.add_subparsers(dest='cmd', required=True,
