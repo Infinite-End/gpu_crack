@@ -1,0 +1,14 @@
+# gpu_crack 依赖清单
+# 核心（必需）：numpy 后端 + 图像处理 + 反汇编/ELF 解析
+numpy>=2.0
+Pillow>=10.0
+capstone>=5.0
+pyelftools>=0.30
+
+# 可选：GPU 后端（装 CUDA 版 torch 后 GPU 内核生效；不装则自动回落 numpy）
+#   pip install torch --index-url https://download.pytorch.org/whl/cu130
+# torch
+
+# 可选：仅 consistency.py 的跨实现交叉校验需要
+pycryptodome>=3.20
+cryptography>=41

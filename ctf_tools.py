@@ -37,7 +37,7 @@ ctf_tools.py — CTF 常用密码学内核（与 gpu_crack.py 共用后端）
   python ctf_tools.py xorbrute --data-hex 1b37373331363f78151b7f2b783431333d --max-len 3
   python ctf_tools.py aesctr   --key-hex <24B> --nonce-hex <8B> --mode ks --length 64
 
-完整参数/输出/退出码见 E:\\gpu_crack\\CLI_REFERENCE.md。
+完整参数/输出/退出码见 CLI_REFERENCE.md。
 """
 
 from __future__ import annotations
@@ -876,7 +876,7 @@ def cmd_xorbrute(a):
 
 def main():
     ap = argparse.ArgumentParser(
-        description='ctf_tools — CTF 密码学内核（完整说明见 E:\\gpu_crack\\CLI_REFERENCE.md）')
+        description='ctf_tools — CTF 密码学内核（完整说明见 CLI_REFERENCE.md）')
     ap.add_argument('--backend', default='auto', choices=['auto', 'torch', 'numpy'],
                     help='计算后端：auto=torch-cuda→torch-cpu→numpy（默认 auto）')
     ap.add_argument('--chunk', type=int, default=1 << 14,

@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-ctf.py — ctf-toolkit 统一入口（规范性 CLI 见 E:\\gpu_crack\\CLI_REFERENCE.md）
+ctf.py — ctf-toolkit 统一入口（规范性 CLI 见仓库根目录的 CLI_REFERENCE.md）
 
 职责
 ----
-1. 自动挑选解释器：CTF_PYTHON（若设置且存在）→ Python315（torch+CUDA）→ 当前解释器。
-2. 把 <module> 映射到工具箱里的实际脚本（默认 E:\\gpu_crack，可用 CTF_TOOLKIT_DIR 覆盖）。
+1. 自动挑选解释器：CTF_PYTHON（若设置且存在）→ PATH 上的 python/python3（torch+CUDA）→ 当前解释器。
+2. 把 <module> 映射到工具箱里的实际脚本（默认本仓库根目录，可用 CTF_TOOLKIT_DIR 覆盖）。
 3. 全局参数 --backend/--chunk 放在模块前后均可（内部自动挪到子命令之前）。
 4. `selftest` 依次跑 gpu bench + ctf_tools/ctf_ext/ctf_misc 三个模块自测，退出码聚合。
 
@@ -33,10 +33,15 @@ ctf.py — ctf-toolkit 统一入口（规范性 CLI 见 E:\\gpu_crack\\CLI_REFER
 from __future__ import annotations
 
 import os
+import re
+import shutil
 import subprocess
 import sys
 
-TOOLKIT = os.environ.get('CTF_TOOLKIT_DIR', r'E:\gpu_crack')
+# 仓库根目录 = 本文件向上两级（skill/scripts/ctf.py -> skill -> 仓库根）；可用 CTF_TOOLKIT_DIR 覆盖
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_DEFAULT_TOOLKIT = os.path.dirname(os.path.dirname(_HERE))
+TOOLKIT = os.environ.get('CTF_TOOLKIT_DIR') or _DEFAULT_TOOLKIT
 
 # module -> script
 SCRIPTS = {
@@ -51,32 +56,79 @@ SCRIPTS = {
     'gadgets': 'ctf_misc.py', 'elfinfo': 'ctf_misc.py',
 }
 
-# 优先使用的 GPU 解释器候选
-PY_CANDIDATES = [
-    os.environ.get('CTF_PYTHON', ''),
-    r'C:\Users\ie\AppData\Local\Programs\Python\Python315\python.exe',
-    sys.executable,
-]
+# 解释器探测结果缓存（按 CTF_PYTHON 取值区分，避免每轮重复拉起子进程）
+_PICKED = {}
+
+
+def _candidate_interpreters():
+    """按优先级产出候选解释器路径，全部自动发现，不含任何硬编码本机路径。
+
+    顺序：CTF_PYTHON -> 当前解释器 -> PATH 上的 python3/python
+          -> Windows `py -0p` 登记的每个版本 -> 仓库内 .venv/venv
+    """
+    seen = set()
+
+    def ok(p):
+        if not p:
+            return None
+        try:
+            p = os.path.abspath(p)
+        except Exception:
+            return None
+        if p in seen or not os.path.isfile(p):
+            return None
+        seen.add(p)
+        return p
+
+    yield from filter(None, [ok(os.environ.get('CTF_PYTHON', ''))])
+
+    for name in (sys.executable, shutil.which('python3'), shutil.which('python')):
+        p = ok(name)
+        if p:
+            yield p
+
+    # Windows：py 启动器登记的所有已安装版本（含各版本共存的场景）
+    if os.name == 'nt':
+        launcher = shutil.which('py')
+        if launcher:
+            try:
+                r = subprocess.run([launcher, '-0p'], capture_output=True, text=True,
+                                   timeout=20, encoding='utf-8', errors='replace')
+                for line in (r.stdout or '').splitlines():
+                    m = re.search(r'([A-Za-z]:\\.*?\.exe)', line)
+                    if m:
+                        p = ok(m.group(1))
+                        if p:
+                            yield p
+            except Exception:
+                pass
+
+    # 仓库根下的虚拟环境（用户克隆后常直接建在这里）
+    for rel in ('.venv/Scripts/python.exe', '.venv/bin/python',
+                'venv/Scripts/python.exe', 'venv/bin/python'):
+        p = ok(os.path.join(TOOLKIT, rel.replace('/', os.sep)))
+        if p:
+            yield p
 
 
 def pick_python() -> str:
-    """挑一个 import torch 且 CUDA 可用的解释器；都不行就返回当前解释器。
+    """自动挑一个 import torch 且 CUDA 可用的解释器；都不行就返回当前解释器。
 
     显式设置了 CTF_PYTHON 时优先尊重（哪怕没有 CUDA，也能用 numpy 后端跑）。
     """
-    env_py = os.environ.get('CTF_PYTHON', '')
-    if env_py and os.path.exists(env_py):
-        return env_py
-    for p in PY_CANDIDATES:
-        if not p or not os.path.exists(p):
-            continue
+    key = os.environ.get('CTF_PYTHON', '')
+    if key in _PICKED:
+        return _PICKED[key]
+    for p in _candidate_interpreters():
         try:
             r = subprocess.run([p, '-c', 'import torch;assert torch.cuda.is_available()'],
                                capture_output=True, timeout=60)
             if r.returncode == 0:
+                _PICKED[key] = p
                 return p
         except Exception:
             continue
+    _PICKED[key] = sys.executable
     return sys.executable
 
 

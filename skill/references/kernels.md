@@ -3,8 +3,8 @@
 | 文档属性 | 值 |
 |---|---|
 | 文档版本 | v2.1（2026-11-01） |
-| 定位 | **选型速查**：题型 → 内核 → 验证向量 → 吞吐。完整参数/输出/退出码以 `E:\gpu_crack\CLI_REFERENCE.md` 为准 |
-| 环境 | `E:\gpu_crack`；解释器 `C:\Users\ie\AppData\Local\Programs\Python\Python315\python.exe`（torch 2.14.1+cu130，CUDA ok） |
+| 定位 | **选型速查**：题型 → 内核 → 验证向量 → 吞吐。完整参数/输出/退出码以仓库根 `CLI_REFERENCE.md` 为准 |
+| 环境 | 仓库根目录；解释器 PATH 上的 `python3`/`python`（需 torch 2.14.1+cu130 才有 GPU，否则自动回落 numpy） |
 | 性能口径 | RTX 5070 Laptop 8 GB 本机复测；随驱动/温度波动 2~3 倍，先跑 `bench` |
 
 ## 1. 题型 → 内核 决策表
@@ -83,7 +83,7 @@
 
 ## 6. 通用约定
 
-- **入口**：优先 `python C:\Users\ie\.dsh\skills\ctf-toolkit\scripts\ctf.py <子命令> ...`；参数不确认时先 `--help`。
+- **入口**：优先 `python scripts/ctf.py <子命令> ...`（本 skill 内）；参数不确认时先 `--help`。
 - **hex 格式族**（重要，容易踩）：
   - `ctf_tools` 的所有 `*-hex` 容忍 `0x` 前缀与空白；
   - `ctf_ext` 的**整数**参数（`--n/--c/--e/--outs/--mod`、Speck 的 key/data）容忍 `0x`；**字节串**参数（tea/rc4/encode 的 data、`--target`）必须裸 hex；

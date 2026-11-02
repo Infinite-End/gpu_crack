@@ -13,7 +13,7 @@
   8. 统一入口 help 列出全部子命令。
 
 用法：
-  python -X utf8 E:\\gpu_crack\\doc_lint.py
+  python -X utf8 doc_lint.py
 退出码：0 = ALL PASS；1 = 有失败项。
 """
 import os
@@ -23,8 +23,9 @@ import sys
 
 PY = sys.executable
 ROOT = os.path.dirname(os.path.abspath(__file__))
-SRC_SKILL = r'C:\Users\ie\.dsh\skills\ctf-toolkit'
-# 仓库内优先用 skill/ 镜像（GitHub 副本），否则回退到 DSH 的 skill 目录
+# 可选：外部 skill 源目录；设置 CTF_SKILL_SRC 后额外校验仓库内 skill/ 镜像与之逐字节一致
+SRC_SKILL = os.environ.get('CTF_SKILL_SRC', '')
+# 仓库内优先用 skill/ 镜像，否则回退到 CTF_SKILL_DIR
 SKILL = os.environ.get('CTF_SKILL_DIR', '')
 if not SKILL:
     SKILL = os.path.join(ROOT, 'skill') if os.path.isdir(os.path.join(ROOT, 'skill')) else SRC_SKILL
@@ -114,10 +115,22 @@ check('kernels.md lists all 26 functional subcommands', not missing_kern, missin
 # ---------- 5. 引用的本地文件存在 ----------
 file_refs = set()
 for text in doc_text.values():
-    file_refs |= set(re.findall(r'E:\\gpu_crack\\[\w.\-]+|references[/\\][\w.\-]+|scripts[/\\][\w.\-]+', text))
-bad_files = [r for r in sorted(file_refs)
-             if not os.path.exists(r if r.startswith('E:\\gpu_crack\\')
-                                   else os.path.join(SKILL, r.replace('\\', '/')))]
+    file_refs |= set(re.findall(
+        r'skill/[\w.\-/]+|(?<![\w/])references[/\\][\w.\-]+|(?<![\w/])scripts[/\\][\w.\-]+'
+        r'|(?<![\w/])(?:README|CLI_REFERENCE)\.md', text))
+
+
+def _resolve_ref(ref):
+    """把文档中的相对引用解析为磁盘路径（skill/* -> 仓库根，references|scripts -> skill 目录）。"""
+    r = ref.replace('\\', '/')
+    if r.startswith('skill/'):
+        return os.path.join(ROOT, r)
+    if r.startswith(('references/', 'scripts/')):
+        return os.path.join(SKILL, r)
+    return os.path.join(ROOT, r)
+
+
+bad_files = [r for r in sorted(file_refs) if not os.path.exists(_resolve_ref(r))]
 check('referenced files exist', not bad_files, bad_files)
 
 # ---------- 6. 乱码 / TODO 残留 ----------

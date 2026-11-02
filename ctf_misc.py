@@ -35,7 +35,7 @@ ctf_misc.py — 取证（图片/文件层）与 Pwn 辅助工具集（纯 CPU，
   python ctf_misc.py gadgets  --file vuln --filter "pop rdi"
   python ctf_misc.py elfinfo  --file vuln
 
-完整参数/输出/退出码见 E:\\gpu_crack\\CLI_REFERENCE.md。
+完整参数/输出/退出码见 CLI_REFERENCE.md。
 """
 
 from __future__ import annotations
@@ -802,7 +802,7 @@ def _cmd_cycfind(a):
 
 def main():
     ap = argparse.ArgumentParser(
-        description='ctf_misc — 取证与 Pwn 辅助（纯 CPU；完整说明见 E:\\gpu_crack\\CLI_REFERENCE.md）')
+        description='ctf_misc — 取证与 Pwn 辅助（纯 CPU；完整说明见 CLI_REFERENCE.md）')
     sub = ap.add_subparsers(dest='cmd', required=True,
                             metavar='{selftest,lsb,stegscan,imgdiff,bitplane,cyclic,cycfind,gadgets,elfinfo}')
     sub.add_parser('selftest', help='自测（全 PASS 退出码 0）')

@@ -37,7 +37,7 @@ gpu_crack.py — 通用 GPU 批量爆破 / 校验框架（CTF toolkit 主框架�
   python gpu_crack.py ksscore --target-hex 3836c93c...
   python gpu_crack.py lfsrscan --taps 25:10,11,24 --bits 1011...
 
-完整参数/输出/退出码见 E:\\gpu_crack\\CLI_REFERENCE.md。
+完整参数/输出/退出码见 CLI_REFERENCE.md。
 依赖：torch（CUDA 版最好）；无 torch 时自动退回 numpy（慢但能跑）。
 """
 
@@ -665,7 +665,7 @@ def cmd_lfsrscan(a):
 # ---------------------------------------------------------------- CLI
 def main():
     ap = argparse.ArgumentParser(
-        description="gpu_crack — GPU 批量爆破/校验框架（完整说明见 E:\\gpu_crack\\CLI_REFERENCE.md）",
+        description="gpu_crack — GPU 批量爆破/校验框架（完整说明见 CLI_REFERENCE.md）",
         formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
     ap.add_argument("--backend", default="auto", choices=["auto", "torch", "numpy"],
                     help="计算后端：auto=torch-cuda→torch-cpu→numpy（默认 auto）")

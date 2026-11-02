@@ -3,7 +3,7 @@
 | 文档属性 | 值 |
 |---|---|
 | 文档版本 | v1.0（2026-11-01） |
-| 适用工具 | gpu_crack toolkit v2（`E:\gpu_crack\`） |
+| 适用工具 | gpu_crack toolkit v2（仓库根目录） |
 | 校验状态 | 与 `--help` 和各模块自测一致；验收套件 129/129 PASS |
 | 配套文档 | [README.md](README.md)（项目说明）、skill 的 `SKILL.md` / `references/kernels.md`（使用策略） |
 
@@ -66,7 +66,7 @@
 | 26 | ctf_misc | `elfinfo` | ELF 保护/导入/PLT/GOT 解析 |
 
 另有 3 个模块级自测子命令：`ctf_tools.py selftest`、`ctf_ext.py selftest`、`ctf_misc.py selftest`
-（`gpu_crack.py` 无 selftest 子命令，主框架自测在 `E:\gpu_crack\selftest.py`）。
+（`gpu_crack.py` 无 selftest 子命令，主框架自测在 `selftest.py`）。
 统一入口的 `ctf.py selftest` 是**特殊命令**：一次跑 `bench + 3 个模块自测`，不是单个模块的子命令。
 
 ---
@@ -188,7 +188,7 @@ python ctf.py lfsrscan --taps "25:10,11,24[;28:12,22,25 ...]" --bits <0/1 串> [
 ### 2.1 `selftest` — 已知向量自测
 
 ```
-python E:\gpu_crack\ctf_tools.py [--backend {torch,numpy}] selftest
+python ctf_tools.py [--backend {torch,numpy}] selftest
 ```
 
 - 说明：`selftest` 是模块级子命令，必须直接运行模块脚本；统一入口的 `ctf.py selftest`
@@ -351,7 +351,7 @@ python ctf.py aesctr --key-hex <24B> --nonce-hex <8B> [--mode {ks,enc,dec}]
 ### 3.1 `selftest`
 
 ```
-python E:\gpu_crack\ctf_ext.py [--backend numpy] selftest
+python ctf_ext.py [--backend numpy] selftest
 ```
 
 - 输出：TEA/XTEA/XXTEA/Speck32/64/Speck64/128/RC4/LCG/MD5/RSA（含共模、广播、p-1）/自动解码 的 PASS 行。
@@ -473,7 +473,7 @@ python ctf.py encode (--data-hex <hex> | --data <原始文本>)
 ### 4.1 `selftest`
 
 ```
-python E:\gpu_crack\ctf_misc.py selftest
+python ctf_misc.py selftest
 ```
 
 - 输出：`[LSB ...] PASS` … `[selftest] 全部 PASS`。
@@ -605,7 +605,7 @@ python ctf.py elfinfo --file <elf>
 
 ## 7. 统一入口 `ctf.py`
 
-位置：`C:\Users\ie\.dsh\skills\ctf-toolkit\scripts\ctf.py`
+位置：`skill\scripts\ctf.py`（仓库内镜像；skill 安装在别处时用 `CTF_TOOLKIT_DIR` 指回仓库根）
 
 ```
 python ctf.py <module-or-subcommand> [参数...]
@@ -614,7 +614,7 @@ python ctf.py help                     # 打印帮助
 ```
 
 - 模块名即子命令名（`bench`、`mtscan`、`chacha`、`rsa`、`lsb`…），见 0.3 总表。
-- 自动挑选解释器：`CTF_PYTHON`（若设置且存在）→ 探测 `C:\...\Python315\python.exe`（torch+CUDA）→ 当前解释器。
-- `CTF_TOOLKIT_DIR` 可覆盖工具箱目录（默认 `E:\gpu_crack`）。
+- 自动挑选解释器：`CTF_PYTHON`（若设置且存在）→ 自动探测（当前解释器、PATH 上的 `python3`/`python`、Windows `py -0p` 登记的所有版本、仓库内 `.venv`/`venv`）中第一个 `import torch` 且 `torch.cuda.is_available()` 为真的 → 都不行则回落当前解释器（走 numpy 后端）。
+- `CTF_TOOLKIT_DIR` 可覆盖工具箱目录（默认：`ctf.py` 向上两级的仓库根目录）。
 - 全局参数 `--backend/--chunk` 放在模块名前后均可；对不支持它们的模块（ctf_misc）会提示忽略。
 - 退出码：见第 6 节。

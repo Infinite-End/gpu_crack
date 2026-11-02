@@ -40,7 +40,7 @@
 
 ## 3. 环境与解释器
 
-### 3.1 依赖
+### 3.1 依赖与安装
 
 | 依赖 | 版本（本机） | 用途 |
 |---|---|---|
@@ -48,25 +48,39 @@
 | torch | 2.14.1+cu130 | GPU 后端（无则自动 numpy） |
 | numpy | 2.5.4 | 数组/标量后端 |
 | Pillow | 13.0.0 | `ctf_misc` 图像处理 |
-| capstone | 5.0.7 | `gadgets` 反汇编 |
+| capstone | 5.0.9 | `gadgets` 反汇编 |
+| pyelftools | 0.33 | `elfinfo` 解析 ELF |
 | pycryptodome / cryptography | 4.2.0 / 50.0.2 | **仅** `consistency.py` 交叉校验用 |
+
+安装（克隆后一次即可）：
+
+```bash
+git clone https://github.com/Infinite-End/gpu_crack.git
+cd gpu_crack
+python -m venv .venv
+.venv\\Scripts\\activate        # Windows；Linux/macOS 用 source .venv/bin/activate
+pip install -r requirements.txt
+pip install torch   # 可选：GPU 加速；CUDA 版安装命令见 https://pytorch.org/get-started/locally/
+```
+
+只有 `numpy` 是硬性要求：没有 torch 或没有 CUDA 也能跑，GPU 内核会自动回落 numpy 后端。
 
 ### 3.2 解释器选择算法（`ctf.py`）
 
 按顺序取第一个可用者：
 
 1. 环境变量 `CTF_PYTHON` 指向的解释器（只要文件存在即用，哪怕没有 CUDA）；
-2. `C:\Users\ie\AppData\Local\Programs\Python\Python315\python.exe`（探测 `import torch; torch.cuda.is_available()`）；
+2. PATH 上的 `python3` / `python`（探测 `import torch; torch.cuda.is_available()`）；
 3. 运行 `ctf.py` 的当前解释器。
 
 ### 3.3 路径解析与环境变量
 
 | 变量 | 默认值 | 作用 |
 |---|---|---|
-| `CTF_TOOLKIT_DIR` | `E:\gpu_crack` | 工具箱目录（`ctf.py` 找模块脚本用） |
+| `CTF_TOOLKIT_DIR` | 仓库根目录（`ctf.py` 向上两级） | 工具箱目录（`ctf.py` 找模块脚本用） |
 | `CTF_PYTHON` | 见 3.2 | 强制指定解释器 |
 
-skill 目录：`C:\Users\ie\.dsh\skills\ctf-toolkit\`（统一入口 `scripts\ctf.py`、文档 `SKILL.md`、`references\kernels.md`）。
+skill 目录：仓库内 `skill/`（统一入口 `skill/scripts/ctf.py`、文档 `skill/SKILL.md`、`skill/references/kernels.md`）。
 
 ### 3.4 后端（backend）
 
@@ -84,14 +98,14 @@ skill 目录：`C:\Users\ie\.dsh\skills\ctf-toolkit\`（统一入口 `scripts\ct
 ## 4. 快速开始
 
 ```powershell
-$py = 'C:\Users\ie\AppData\Local\Programs\Python\Python315\python.exe'
-$ctf = 'C:\Users\ie\.dsh\skills\ctf-toolkit\scripts\ctf.py'
+$py = 'python'                          # 需装有 torch + CUDA 的解释器
+$ctf = '.\skill\scripts\ctf.py'
 
 # 0) 先摸当前机器吞吐（换机器/驱动必跑）
-& $py E:\gpu_crack\gpu_crack.py bench
+& $py .\gpu_crack.py bench
 
 # 1) 弱随机数：暴力 mt19937 种子（2^32 全空间约 8 分钟）
-& $py E:\gpu_crack\gpu_crack.py mtscan --key-hex ac2f75c043fbc36709d315f2 --seed-count 4294967296
+& $py .\gpu_crack.py mtscan --key-hex ac2f75c043fbc36709d315f2 --seed-count 4294967296
 
 # 2) 统一入口（自动选解释器、自动把 --backend/--chunk 挪到正确位置）
 python $ctf selftest
@@ -144,7 +158,7 @@ python ctf.py help
 ## 7. 库 API（Python import）
 
 ```python
-import sys; sys.path.insert(0, r'E:\gpu_crack')
+import sys; sys.path.insert(0, r'.')
 import gpu_crack as G
 
 G.init_backend('torch')            # 'auto' | 'torch' | 'numpy'
@@ -176,7 +190,7 @@ ct = G.aes192_ecb(blocks, key_t, None, a_idx, b_val)          # blocks/key_t/a_i
 | 1. 模块自测 | `python -X utf8 ctf_tools.py selftest`（`ctf_ext.py` / `ctf_misc.py` 同理） | 全 PASS，退出码 0 |
 | 2. 主框架自测 | `python -X utf8 selftest.py` | AES-192 NIST、mt19937 参考、mtscan/sboxscan 植入-找回全 PASS |
 | 3. 跨实现一致性 | `python -X utf8 consistency.py` | `通过 32/32`（torch/numpy/pycryptodome/cryptography/hashlib/zlib 交叉） |
-| 4. 组合自测 | `python C:\Users\ie\.dsh\skills\ctf-toolkit\scripts\ctf.py selftest` | 四模块全 PASS，退出码 0 |
+| 4. 组合自测 | `python .\skill\scripts\ctf.py selftest` | 四模块全 PASS，退出码 0 |
 | 5. 文档一致性 | `python -X utf8 doc_lint.py` | `DOC-LINT: ALL PASS`（参数/模块/计数/章节与真实 CLI 对齐） |
 
 新增内核的验收标准：① 有已知向量或植入-找回；② 双后端一致；③ 参数错误走干净报错（rc=2/1，无 traceback）；
@@ -216,12 +230,12 @@ ct = G.aes192_ecb(blocks, key_t, None, a_idx, b_val)          # blocks/key_t/a_i
 | `stegscan` | JPEG 尾部用 `rfind(FFD9)`（PNG 已改为 chunk 链，无此问题） |
 | `elfinfo` | RELRO 只区分 Full（是/否）；不解析 partial RELRO 细分 |
 | RSA 共模/广播/p-1 素数幂 | 只有库函数，不在 CLI 五连中 |
-| 平台 | 路径/命令按 Windows 编写；在 Linux 上改 `CTF_TOOLKIT_DIR` 与解释器路径即可 |
+| 平台 | 路径/命令示例按 Windows 写；Linux/macOS 上把 `python`/`\` 换成本机习惯即可 |
 
 ## 11. 目录结构
 
 ```
-E:\gpu_crack\
+<仓库根>\
 ├─ gpu_crack.py       主框架（bench/mtscan/sboxscan/ksscore/lfsrscan + 批量内核库）
 ├─ ctf_tools.py       密码学内核（chacha/poly1305/rs63/crc32/xorbrute/aesctr）
 ├─ ctf_ext.py         算法族（tea/speck/rc4/lcg/md5/rsa/encode）
@@ -231,6 +245,7 @@ E:\gpu_crack\
 ├─ doc_lint.py        文档一致性检查（文档中的参数/模块/计数必须与真实 CLI 对齐）
 ├─ README.md          本文件（项目说明）
 ├─ CLI_REFERENCE.md   完整 CLI 参考（参数/输出/退出码/示例）
+├─ requirements.txt    依赖清单（pip install -r requirements.txt）
 ├─ .gitignore / .gitattributes
 └─ skill/             DSH skill 定义同步副本（GitHub 版）
    ├─ SKILL.md
@@ -262,8 +277,8 @@ E:\gpu_crack\
 - 仓库根目录 = 本目录。`skill/` 是 DSH skill 定义（`SKILL.md` / `references/kernels.md` / `scripts/ctf.py`）的**同步副本**；
   修改 skill 源后需同步到 `skill/`，`doc_lint.py` 会校验镜像一致性。
 - 在其它机器/其它模型上使用：
-  1. `git clone` 后设置 `CTF_TOOLKIT_DIR=<仓库根目录>`；
-  2. 设置 `CTF_PYTHON=<本地带 torch 的解释器>`（没有 GPU/torch 时用 `--backend numpy` 也可正确运行）；
+  1. `git clone` 后**无需任何路径配置**——`ctf.py` 以自身位置向上两级定位仓库根（`CTF_TOOLKIT_DIR` 仅用于覆盖）；
+  2. **解释器自动发现**：`CTF_PYTHON` → 当前解释器 → PATH 上的 `python3`/`python` → Windows `py -0p` 登记的各版本 → 仓库内 `.venv`/`venv`，取第一个 `torch.cuda.is_available()` 为真的；全都不行则回落当前解释器走 numpy 后端；
   3. 跑 `python -X utf8 doc_lint.py`（有 repo 内 `skill/` 时自动用镜像）与 `python -X utf8 consistency.py` 确认环境。
 
 ## 14. 许可证
