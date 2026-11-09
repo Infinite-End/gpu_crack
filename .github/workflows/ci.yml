@@ -75,6 +75,10 @@ jobs:
       - name: Examples --check (generate + rerun every example command)
         run: python -X utf8 examples/make_examples.py --check
 
+      # DSH 技能插件契约（不启动 DSH，只验证 provider 形状/候选/正文/资源/工具箱发现）
+      - name: DSH skill plugin contract (node smoke)
+        run: node dsh-plugin/test/smoke.mjs
+
       # 最终门禁：一键跑全部验证层（含 fuzz_kernels.py --quick；doc_lint 已在最前快速失败）
       - name: Verify all layers
         run: python -X utf8 verify_all.py --backend numpy

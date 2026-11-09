@@ -2,7 +2,7 @@
 
 | 文档属性 | 值 |
 |---|---|
-| 文档版本 | v3.2（2026-11-09） |
+| 文档版本 | v3.3（2026-11-09） |
 | 适用工具 | gpu_crack toolkit v2（仓库根目录） |
 | 校验状态 | 与 `--help` 和各模块自测一致；`python -X utf8 verify_all.py` 六层全绿（doc_lint 50 / 模块 13+31+23 / 主框架 42 / consistency 45 / fuzz 17 类 / dispatcher+示例） |
 | 配套文档 | [README.md](README.md)（项目说明）、skill 的 `SKILL.md` / `references/kernels.md`（使用策略） |
@@ -830,3 +830,4 @@ python ctf.py -- <module> [参数...]    # 强制结束全局参数解析，避�
 
 说明：`verify_all.py`、`fuzz_kernels.py` 是 v3.2 新增的验证入口；`doc_lint.py` 会检查这两者是否被文档引用，
 以及文档版本是否等于单一真源 `ctf_registry.VERSION`。
+

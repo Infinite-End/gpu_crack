@@ -8,11 +8,11 @@
 
 | 文档属性 | 值 |
 |---|---|
-| 文档版本 | v3.2（2026-11-09） |
+| 文档版本 | v3.3（2026-11-09） |
 | 工具版本 | gpu_crack toolkit v2 |
 | 校验状态 | `python -X utf8 verify_all.py` 全绿（doc_lint 50 项 / 模块自测 13+31+23 项 / 主框架 42 项 / consistency 45/45 / fuzz 17 类 / 统一入口+示例 6/6） |
 | 适用环境 | Windows + Python 3.15 + torch 2.14.1+cu130（无 torch 时自动回退 numpy） |
-| GitHub | https://github.com/Infinite-End/gpu_crack（**public / MIT**，tag `v3.2`） |
+| GitHub | https://github.com/Infinite-End/gpu_crack（**public / MIT**，tag `v3.3`） |
 | 配套文档 | [CLI_REFERENCE.md](CLI_REFERENCE.md)（**参数/输出/退出码以它为准**）、`skill/SKILL.md` 与 `skill/references/kernels.md` |
 | 许可证 | [MIT](LICENSE) |
 
@@ -290,6 +290,7 @@ python -X utf8 verify_all.py --quick --only doc,fuzz   # 快速/局部
 ├─ docs/bench.md      本机吞吐基准（`bench --markdown` 生成，勿手改）
 ├─ examples/          示例输入生成器 + 逐条跑法（`--check` 逐条复跑；examples/out/ 不入库）
 ├─ .github/workflows/ci.yml  CI：doc_lint + 自测 + 对拍 + fuzz + 统一入口 + 示例复跑 + verify_all
+├─ dsh-plugin/         DeepSeek Harness 插件（把 skill/ 注册为 bundled 技能；见 dsh-plugin/README.md）
 ├─ README.md          本文件（项目说明）
 ├─ CLI_REFERENCE.md   完整 CLI 参考（参数/输出/退出码/示例）
 ├─ requirements.txt    依赖清单（pip install -r requirements.txt）
@@ -304,7 +305,19 @@ python -X utf8 verify_all.py --quick --only doc,fuzz   # 快速/局部
 
 ## 12. 变更记录
 
-### v3.2（2026-11-09，本轮：全面对抗测试 + 缺陷修复 + 第六层验证）
+### v3.3（2026-11-09：DeepSeek Harness 技能插件）
+
+- 新增 `dsh-plugin/`：DSH plugin bundle **`dsh-skill-gpu-crack`**，把仓库的 `skill/` 目录注册为 DSH
+  的 `bundled` 技能 provider（技能名 `ctf-toolkit`）。零运行期依赖，不复制技能文件：`resourceBase`
+  直指 `skill/`，技能正文与 `scripts/ctf.py`、`references/kernels.md` 等资源在每次加载时从仓库实时读取，
+  仓库更新后无需重装插件。
+  - 装载/卸载：用 DSH 的 plugin-manager（安装 spec `link:E:\gpu_crack\dsh-plugin`）或 CLI；详见 `dsh-plugin/README.md`。
+  - 自带离线契约测试 `node dsh-plugin/test/smoke.mjs`（provider 形状 / 候选字段 / 正文去 frontmatter /
+    资源存在 / 工具箱向上发现），不启动 DSH 也能验证。
+  - 安装后模型技能目录出现 `ctf-toolkit`，加载时会给出 `Base directory for this skill: <repo>/skill`。
+- 版本真源 `ctf_registry.VERSION` 升到 `3.3`，README/CLI_REFERENCE/SKILL/kernels 文档版本同步。
+
+### v3.2（2026-11-09：全面对抗测试 + 缺陷修复 + 第六层验证）
 
 > 方法：6 个并行 owner 各负责一个模块/基础设施范围，先对抗复现、再修根因、最后把探针固化为回归断言；
 > 独立 verifier 复核（见 `reports/`，工作产物不入库）。
@@ -407,7 +420,7 @@ python -X utf8 verify_all.py --quick --only doc,fuzz   # 快速/局部
 
 ## 13. GitHub 仓库与跨机使用
 
-- 仓库：https://github.com/Infinite-End/gpu_crack （**public / 开源**），标签 `v3.2`。
+- 仓库：https://github.com/Infinite-End/gpu_crack （**public / 开源**），标签 `v3.3`。
 - 仓库根目录 = 本目录。`skill/` 是 skill 定义（`SKILL.md` / `SKILL.en.md` / `references/kernels.md` / `scripts/ctf.py` / `agents/openai.yaml`）的**同步副本**；
   修改 skill 源后需同步到 `skill/`，`doc_lint.py` 会校验镜像一致性。
 - 在其它机器/其它模型上使用：
@@ -415,6 +428,8 @@ python -X utf8 verify_all.py --quick --only doc,fuzz   # 快速/局部
      仅当 `skill/` 被**单独拷贝到仓库之外**（如 `~/.codex/skills/ctf-toolkit`）时，才需要把 `CTF_TOOLKIT_DIR` 指向仓库根；
   2. **解释器自动发现**：`CTF_PYTHON` → 当前解释器 → PATH 上的 `python3`/`python` → Windows `py -0p` 登记的各版本 → 仓库内 `.venv`/`venv`，取第一个 `torch.cuda.is_available()` 为真的；全都不行则回落当前解释器走 numpy 后端；
   3. 跑 `python -X utf8 doc_lint.py`（有 repo 内 `skill/` 时自动用镜像）与 `python -X utf8 consistency.py` 确认环境。
+- **DeepSeek Harness（DSH）集成**：`dsh-plugin/` 是本地 DSH plugin bundle，把 `skill/` 注册为内置技能
+  （技能名 `ctf-toolkit`，装载/卸载命令见 `dsh-plugin/README.md`）。技能内容实时读取仓库，无需复制。
 
 ## 14. 许可证
 

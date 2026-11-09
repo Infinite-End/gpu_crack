@@ -1,0 +1,19 @@
+# dsh-skill-gpu-crack —— DSH bundle patch
+#
+# 把 gpu_crack 的 skill/ 目录注册成 DSH 内置技能（bundled skill provider），
+# 不复制、不迁移：技能内容直接读取仓库里的 skill/SKILL.md，仓库更新即时生效。
+#
+# 安装（本地 link 方式，开发/单机）：
+#   dsh plugin --profile desktop add link:E:\gpu_crack\dsh-plugin
+# 或通过 DSH 的 plugin-manager 工具安装同一路径。
+#
+# assetRoot 必须是不带引号问题的绝对路径；它指向技能目录（含 SKILL.md、
+# references/、scripts/）。skills 的 resourceBase 会以该目录为基准，
+# 因此 skill 里的相对路径 `scripts/ctf.py` 可被正确解析，ctf.py 也能从
+# 仓库位置向上找到 gpu_crack.py。
+
+- insert:
+    - id: skill-gpu-crack
+      name: dsh-skill-gpu-crack
+      config:
+        assetRoot: 'E:\gpu_crack\skill'
