@@ -8,11 +8,11 @@
 
 | 文档属性 | 值 |
 |---|---|
-| 文档版本 | v3.0（2026-11-09） |
+| 文档版本 | v3.1（2026-11-09） |
 | 工具版本 | gpu_crack toolkit v2 |
 | 校验状态 | `ctf.py selftest` 全 PASS；`consistency.py` 32/32；`doc_lint.py` 文档一致性 35 项全 PASS |
 | 适用环境 | Windows + Python 3.15 + torch 2.14.1+cu130（无 torch 时自动回退 numpy） |
-| GitHub | https://github.com/Infinite-End/gpu_crack（**public / MIT**，tag `v3.0`） |
+| GitHub | https://github.com/Infinite-End/gpu_crack（**public / MIT**，tag `v3.1`） |
 | 配套文档 | [CLI_REFERENCE.md](CLI_REFERENCE.md)（**参数/输出/退出码以它为准**）、`skill/SKILL.md` 与 `skill/references/kernels.md` |
 | 许可证 | [MIT](LICENSE) |
 
@@ -247,8 +247,10 @@ ct = G.aes192_ecb(blocks, key_t, None, a_idx, b_val)          # blocks/key_t/a_i
 <仓库根>\
 ├─ gpu_crack.py       主框架（bench/mtscan/sboxscan/ksscore/lfsrscan + 批量内核库）
 ├─ ctf_tools.py       密码学内核（chacha/poly1305/rs63/crc32/xorbrute/aesctr）
-├─ ctf_ext.py         算法族（tea/speck/rc4/lcg/md5/rsa/encode/mdext/bm/zipbrute/eccscan）/ cf. ctf_common.py
+├─ ctf_ext.py         算法族（tea/speck/rc4/lcg/md5/rsa/encode/mdext/bm/zipbrute/eccscan）
 ├─ ctf_common.py      共享调度（分块 + OOM 自动降档 + 进度 ETA + 断点续跑 + JSON 输出）
+├─ ctf_registry.py    内核注册表（子命令 → 脚本/分组/能力），唯一真源；`python ctf_registry.py` 自检
+├─ plugins/           插件内核目录（放 *.py + `KERNEL` 元数据即可，见 plugins/README.md）
 ├─ ctf_misc.py        取证 & Pwn（lsb/stegscan/imgdiff/bitplane/cyclic/cycfind/gadgets/elfinfo）
 ├─ selftest.py        主框架自测（AES-192 NIST / mt19937 参考 / 植入-找回 / 性能）
 ├─ consistency.py     跨实现一致性校验（32 项固定向量 + `--fuzz N` 随机对拍）
@@ -269,6 +271,18 @@ ct = G.aes192_ecb(blocks, key_t, None, a_idx, b_val)          # blocks/key_t/a_i
 ```
 
 ## 12. 变更记录
+
+### v3.1（2026-11-09，本轮：插件化 + 单点注册表）
+
+- 新增 `ctf_registry.py`：**唯一真源**记录「子命令 → 脚本 / 分组 / 是否支持 `--chunk`·`--json`」。
+  原先这张表被抄在 `skill/scripts/ctf.py`、`doc_lint.py`、README、CLI_REFERENCE 四处，加内核要改四遍。
+- 新增 `plugins/` 插件目录：放一个 `*.py`（含模块级 `KERNEL = dict(name=..., help=...)` + 可执行入口）
+  即可被统一入口识别，**无需改仓库任何文件**；重名以内置优先并告警，插件加载失败不影响主程序。
+- 自带示例插件 `plugins/morse_decode.py`（`morse` 子命令，摩斯解码）。
+- `ctf.py` 改为从注册表取模块表，**脱离仓库部署时自动回退**到内置表（部署副本仍零配置可跑）；
+  `help` 输出改为按 4 组分类 + 插件单列。
+- `doc_lint.py` 的子命令清单改为从注册表反查，消除"文档与 CLI 名单漂移"的结构性风险。
+- `python ctf_registry.py` 可直接打印注册表自检（内置数、分组、已发现插件）。
 
 ### v3.0（2026-11-09，本轮：工程化收尾）
 
@@ -325,7 +339,7 @@ ct = G.aes192_ecb(blocks, key_t, None, a_idx, b_val)          # blocks/key_t/a_i
 
 ## 13. GitHub 仓库与跨机使用
 
-- 仓库：https://github.com/Infinite-End/gpu_crack （**public / 开源**），标签 `v3.0`。
+- 仓库：https://github.com/Infinite-End/gpu_crack （**public / 开源**），标签 `v3.1`。
 - 仓库根目录 = 本目录。`skill/` 是 skill 定义（`SKILL.md` / `SKILL.en.md` / `references/kernels.md` / `scripts/ctf.py` / `agents/openai.yaml`）的**同步副本**；
   修改 skill 源后需同步到 `skill/`，`doc_lint.py` 会校验镜像一致性。
 - 在其它机器/其它模型上使用：

@@ -55,6 +55,8 @@ does wins. If none qualifies, the current interpreter is used and GPU kernels fa
 | overflow offset needed | `cyclic` + `cycfind` |
 
 Full kernel list with throughput numbers and worked examples: `references/kernels.md`.
+The kernel table's single source of truth is `ctf_registry.py`; extra kernels can be dropped into
+`plugins/*.py` with a module-level `KERNEL = dict(name=..., help=...)` — no repo edits required.
 For any command's own flags: `python scripts/ctf.py <module> --help` (the runtime source of truth —
 never guess parameter names).
 

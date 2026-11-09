@@ -51,12 +51,18 @@ def run(args, timeout=300):
     return r.returncode, r.stdout + r.stderr
 
 
-SCRIPTS = {'gpu_crack.py': ['bench', 'mtscan', 'sboxscan', 'ksscore', 'lfsrscan'],
-           'ctf_tools.py': ['selftest', 'chacha', 'poly1305', 'rs63', 'crc32', 'xorbrute', 'aesctr'],
-           'ctf_ext.py': ['selftest', 'tea', 'speck', 'rc4', 'lcg', 'md5', 'rsa', 'encode',
-                          'mdext', 'bm', 'zipbrute', 'eccscan'],
-           'ctf_misc.py': ['selftest', 'lsb', 'stegscan', 'imgdiff', 'bitplane', 'cyclic', 'cycfind',
-                           'gadgets', 'elfinfo']}
+# 子命令清单的真源在 ctf_registry.py；这里按脚本反查，避免两处名单漂移
+try:
+    import ctf_registry as _REG
+    SCRIPTS = {script: ['selftest'] + list(names)
+               for script, names in _REG.BY_SCRIPT.items()}
+except Exception:                                     # 注册表缺失时退回内置表
+    SCRIPTS = {'gpu_crack.py': ['bench', 'mtscan', 'sboxscan', 'ksscore', 'lfsrscan'],
+               'ctf_tools.py': ['selftest', 'chacha', 'poly1305', 'rs63', 'crc32', 'xorbrute', 'aesctr'],
+               'ctf_ext.py': ['selftest', 'tea', 'speck', 'rc4', 'lcg', 'md5', 'rsa', 'encode',
+                              'mdext', 'bm', 'zipbrute', 'eccscan'],
+               'ctf_misc.py': ['selftest', 'lsb', 'stegscan', 'imgdiff', 'bitplane', 'cyclic',
+                               'cycfind', 'gadgets', 'elfinfo']}
 FLAG_RE = re.compile(r'--[a-zA-Z][a-zA-Z0-9-]*')
 
 # ---------- 0. 文档存在 ----------
@@ -102,13 +108,25 @@ for _py in ('gpu_crack.py', 'ctf_tools.py', 'ctf_ext.py', 'ctf_misc.py', 'consis
 
 print('actual flags (%d)\n' % len(flags))
 
-# ---------- 2. 文档中的参数必须存在 ----------
+# ---------- 2. 文档中的参数必须存在（含插件插件自身声明的参数） ----------
+PLUGINS = {}
+try:
+    import ctf_registry as _R
+    PLUGINS = {p.name: p.path for p in _R.discover_plugins(ROOT)}
+except Exception:
+    PLUGINS = {}
+for name, path in PLUGINS.items():
+    rc, out = run([path, '--help'], timeout=60)
+    for _opt in re.findall(r'--[a-zA-Z][a-zA-Z0-9-]*', out):
+        flags.add(_opt)
+
 for doc, text in doc_text.items():
     bad = sorted({f for f in FLAG_RE.findall(text) if f not in flags})
     check('doc flags valid: ' + os.path.basename(doc), not bad, bad)
 
 # ---------- 3. 文档中的模块名必须存在 ----------
-VALID = {s for subs in SCRIPTS.values() for s in subs} | {'selftest', 'help', 'test', 'all'}
+VALID = ({s for subs in SCRIPTS.values() for s in subs}
+         | set(PLUGINS) | {'selftest', 'help', 'test', 'all'})
 for doc, text in doc_text.items():
     refs = set(re.findall(r'ctf\.py\s+([a-zA-Z][\w-]*)', text))
     bad = sorted(r for r in refs if r not in VALID)
@@ -156,7 +174,7 @@ for p in DOCS + [os.path.join(ROOT, f) for f in SCRIPTS] + [CTF]:
 
 # ---------- 7. 关键章节 ----------
 for p, text in doc_text.items():
-    check('has version header: ' + os.path.basename(p), ('v3.0' in text) or ('v2.3' in text) or ('v2.2' in text) or ('v2.1' in text) or ('v1.0' in text))
+    check('has version header: ' + os.path.basename(p), ('v3.1' in text) or ('v3.0' in text) or ('v2.3' in text) or ('v2.2' in text) or ('v2.1' in text) or ('v1.0' in text))
 for token in ('退出码矩阵', '稳定契约', '★', 'UTF-8'):
     check('CLI_REFERENCE contains ' + token, token in cli_ref)
 check('CLI_REFERENCE count 30', '30 个功能子命令' in cli_ref)

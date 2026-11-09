@@ -2,7 +2,7 @@
 
 | 文档属性 | 值 |
 |---|---|
-| 文档版本 | v3.0（2026-11-09） |
+| 文档版本 | v3.1（2026-11-09） |
 | 适用工具 | gpu_crack toolkit v2（仓库根目录） |
 | 校验状态 | 与 `--help` 和各模块自测一致；验收套件 129/129 PASS |
 | 配套文档 | [README.md](README.md)（项目说明）、skill 的 `SKILL.md` / `references/kernels.md`（使用策略） |
@@ -38,6 +38,21 @@
 > 直接调用模块脚本时，全局参数**必须**写在子命令之前：
 > `python gpu_crack.py --backend numpy --chunk 8192 mtscan ...`
 > 通过统一入口 `ctf.py` 调用时位置随意：`python ctf.py mtscan ... --backend numpy` 亦可。
+
+### 0.4 插件内核（plugins/）
+
+子命令清单的真源是 `ctf_registry.py`；**新增内核既可以改注册表，也可以完全不动仓库文件**——
+在 `plugins/` 放一个 `.py`，提供模块级 `KERNEL = dict(name=..., help=...)` 并实现
+`if __name__ == '__main__'` 入口即可：
+
+```
+python skill/scripts/ctf.py morse --code "... --- ..."     # 调用插件
+python ctf_registry.py                                     # 查看已发现插件
+```
+
+约束：插件名不得与内置内核重名（重名以内置优先并 `[warn]`）；文件名不得以 `_` 开头；
+插件读取元数据时会执行一次模块顶层代码，因此重活必须放在 `__main__` 守卫内。
+插件不计入 30 个内置功能子命令，也不影响 `doc_lint` 结果。
 
 ### 0.3 子命令总表（30 个功能子命令 + 3 个模块自测）
 | # | 模块 | 子命令 | 一句话用途 |

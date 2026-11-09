@@ -7,10 +7,11 @@ description: GPU-accelerated, command-line CTF toolkit in this repository for ba
 
 | 文档属性 | 值 |
 |---|---|
-| 文档版本 | v3.0（2026-11-09） |
+| 文档版本 | v3.1（2026-11-09） |
 | 适用工具 | gpu_crack toolkit v2（仓库根目录） |
 | 校验状态 | `ctf.py selftest` 全 PASS；`consistency.py` 32/32 |
 | 配套文档 | `CLI_REFERENCE.md`（仓库根，规范性参数/输出/退出码）、`README.md`（仓库根）、`references/kernels.md`、`SKILL.en.md`（英文精简版） |
+| 内核清单 | 真源 `ctf_registry.py`；插件放 `plugins/*.py`（模块级 `KERNEL` 元数据），不改仓库即可扩展；插件不计入 30 个内置子命令 |
 
 本 skill 是**可被任意模型复用**的操作规范。所有事实以仓库文档为准，不要凭记忆猜参数：
 命令行细节查仓库根的 `CLI_REFERENCE.md`，项目说明查 `README.md`。

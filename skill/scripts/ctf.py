@@ -92,7 +92,8 @@ def _toolkit_ready() -> bool:
     return False
 
 # module -> script
-SCRIPTS = {
+# 真源在仓库根的 ctf_registry.py；skill 目录被单独部署时（脱离仓库）回退到内置表。
+_EMBEDDED_SCRIPTS = {
     'bench': 'gpu_crack.py', 'mtscan': 'gpu_crack.py', 'sboxscan': 'gpu_crack.py',
     'ksscore': 'gpu_crack.py', 'lfsrscan': 'gpu_crack.py',
     'chacha': 'ctf_tools.py', 'poly1305': 'ctf_tools.py', 'rs63': 'ctf_tools.py',
@@ -105,6 +106,20 @@ SCRIPTS = {
     'bitplane': 'ctf_misc.py', 'cyclic': 'ctf_misc.py', 'cycfind': 'ctf_misc.py',
     'gadgets': 'ctf_misc.py', 'elfinfo': 'ctf_misc.py',
 }
+
+SCRIPTS = dict(_EMBEDDED_SCRIPTS)
+PLUGINS = {}
+GROUPS = {}
+try:                                     # 插件/注册表只在本仓库内可用，部署副本会自动跳过
+    if TOOLKIT not in sys.path:
+        sys.path.insert(0, TOOLKIT)
+    import ctf_registry as _REG          # noqa: E402
+
+    SCRIPTS = dict(_REG.SCRIPTS)
+    GROUPS = _REG.groups()
+    PLUGINS = {p.name: p.path for p in _REG.discover_plugins(TOOLKIT)}
+except Exception:                        # noqa: BLE001  —— 任何异常都退回内置表，保证可用
+    GROUPS = {}
 
 # 解释器探测结果缓存（按 CTF_PYTHON 取值区分，避免每轮重复拉起子进程）
 _PICKED = {}
@@ -257,7 +272,7 @@ def main() -> int:
     argv = sys.argv[1:]
     if not argv:
         print(__doc__)
-        print('可用模块:', ', '.join(sorted(SCRIPTS)))
+        _print_modules()
         return 1
     py = pick_python()
 
@@ -283,7 +298,7 @@ def main() -> int:
     argv = argv[i:]
     if not argv:
         print(__doc__)
-        print('可用模块:', ', '.join(sorted(SCRIPTS)))
+        _print_modules()
         return 1
     mod, rest = argv[0], argv[1:]
 
@@ -302,20 +317,34 @@ def main() -> int:
 
     if mod in ('help', '-h', '--help'):
         print(__doc__)
-        print('可用模块:', ', '.join(sorted(SCRIPTS)))
+        _print_modules()
         return 0
 
-    if mod not in SCRIPTS:
-        print(f'[错误] 未知模块 {mod}；可用: {", ".join(sorted(SCRIPTS))}', file=sys.stderr)
+    if mod not in SCRIPTS and mod not in PLUGINS:
+        print(f'[错误] 未知模块 {mod}；可用: {", ".join(sorted(list(SCRIPTS) + list(PLUGINS)))}',
+              file=sys.stderr)
         return 2
     if not _toolkit_ready():
         return 2
+    if mod in PLUGINS:                       # 插件：整条命令交给插件脚本自己解析
+        return run(py, PLUGINS[mod], rest)
     gl, rest = split_globals(rest)
     g_ok, dropped = filter_globals(gl_front + gl, GLOBALS_OF[SCRIPTS[mod]])
     if dropped:
         print(f'[提示] {" ".join(dropped)} 对 {SCRIPTS[mod]} 无效，已忽略', file=sys.stderr)
     # 全局选项必须放在子命令之前
     return run(py, SCRIPTS[mod], g_ok + [mod] + rest)
+
+
+def _print_modules() -> None:
+    """按分组打印内置内核，再单列插件（有注册表时分组，否则平铺）。"""
+    if GROUPS:
+        for group, names in GROUPS.items():
+            print(f'  {group}（{len(names)}）: {" ".join(names)}')
+    else:
+        print('可用模块:', ', '.join(sorted(SCRIPTS)))
+    if PLUGINS:
+        print(f'  插件（{len(PLUGINS)}）: {" ".join(sorted(PLUGINS))}')
 
 
 if __name__ == '__main__':
