@@ -1,8 +1,8 @@
-# 内核速查表（一页版）
+﻿# 内核速查表（一页版）
 
 | 文档属性 | 值 |
 |---|---|
-| 文档版本 | v2.2（2026-11-09） |
+| 文档版本 | v2.3（2026-11-09） |
 | 定位 | **选型速查**：题型 → 内核 → 验证向量 → 吞吐。完整参数/输出/退出码以仓库根 `CLI_REFERENCE.md` 为准 |
 | 环境 | 仓库根目录；解释器 PATH 上的 `python3`/`python`（需 torch 2.14.1+cu130 才有 GPU，否则自动回落 numpy） |
 | 性能口径 | RTX 5070 Laptop 8 GB 本机复测；随驱动/温度波动 2~3 倍，先跑 `bench` |
@@ -20,7 +20,7 @@
 | RS(63,31) / GF(256) 码 | `ctf_tools.py rs63` | `--locate` 单字节纠错 |
 | CRC32 / 尾部校验 | `ctf_tools.py crc32` | 尾部 1~2 字节爆破 |
 | 重复 XOR（1~3 字节） | `ctf_tools.py xorbrute` | 密文 <8B 时不可靠 |
-| AES-192-CTR | `ctf_tools.py aesctr` | 计数器块 = nonce8 ‖ ctr64(LE) |
+| AES 密钥长度/模式但只知部分信息 | `ctf_tools.py aesctr` | 128/192/256；`--nonce-mode le/be`；计数器块 8/12/16B |
 | TEA/XTEA/XXTEA | `ctf_ext.py tea` | 输出小端；key 固定 16B |
 | Speck32/64、Speck64/128 | `ctf_ext.py speck` | `--word-bits/--key-words/--rounds` |
 | RC4 | `ctf_ext.py rc4` | key 1~256B |
@@ -28,6 +28,10 @@
 | MD5 口令爆破 | `ctf_ext.py md5` | `--charset/--max-len`，含空口令 |
 | RSA 未知攻击 | `ctf_ext.py rsa` | 五连：小因子→Wiener→Fermat→rho→p-1 |
 | 未知编码层 | `ctf_ext.py encode` | BFS 深度 4；无 flag 特征只打印候选 |
+| MAC/签名可伪造（哈希长度扩展） | `ctf_ext.py mdext` | 需已知原消息长度；MD5 16B / SHA-1 20B 摘要 |
+| 已知输出比特流、要反推 LFSR | `ctf_ext.py bm` | Berlekamp-Massey，需 ≥2L 位；与 `lfsrscan` 互补 |
+| 加密 ZIP 口令 | `ctf_ext.py zipbrute` | 字典或掩码；仅 ZipCrypto，WinZip AES 未支持 |
+| 已知 ECC 公钥但私钥很小 | `ctf_ext.py eccscan` | secp256k1 / P-256，单核 ~1.1 M keys/s |
 | 图片 LSB 隐写 | `ctf_misc.py lsb` | 7 通道模板 × bit0~2 × 序 × 位序 |
 | 文件附加/内嵌数据 | `ctf_misc.py stegscan` | 21 条内嵌 magic；PNG/JPEG 尾部 |
 | 两图差异 | `ctf_misc.py imgdiff` | 包围盒 + LSB 差异 + 可视化 |

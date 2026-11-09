@@ -1,8 +1,8 @@
-# CTF Toolkit — CLI 参考手册
+﻿# CTF Toolkit — CLI 参考手册
 
 | 文档属性 | 值 |
 |---|---|
-| 文档版本 | v2.2（2026-11-09） |
+| 文档版本 | v2.3（2026-11-09） |
 | 适用工具 | gpu_crack toolkit v2（仓库根目录） |
 | 校验状态 | 与 `--help` 和各模块自测一致；验收套件 129/129 PASS |
 | 配套文档 | [README.md](README.md)（项目说明）、skill 的 `SKILL.md` / `references/kernels.md`（使用策略） |
@@ -28,13 +28,18 @@
 | 参数 | 取值 | 默认 | 模块 | 说明 |
 |---|---|---|---|---|
 | `--backend` | `auto` / `torch` / `numpy` | `auto` | gpu_crack, ctf_tools, ctf_ext | `auto` = torch-cuda → torch-cpu → numpy 依次回退 |
-| `--chunk` | 正整数 | gpu_crack `65536`；ctf_tools `16384` | gpu_crack, ctf_tools | 每批候选数；显存不足时减半 |
+| `--chunk` | 正整数 | gpu_crack `65536`；ctf_tools `16384` | gpu_crack, ctf_tools | 每批候选数；显存不足时**自动**减半重试 |
+| `--json` | 开关 | 关 | gpu_crack, ctf_tools, ctf_ext | 结果行改为单行 JSON（`{"event":...}`），便于程序/agent 解析 |
+| `--quiet` | 开关 | 关 | gpu_crack, ctf_tools, ctf_ext | 抑制横幅与进度，只留结果行 |
+| `--no-progress` | 开关 | 关 | gpu_crack, ctf_tools, ctf_ext | 不打印进度/ETA（结果仍输出） |
+| `--checkpoint` | 文件路径 | 无 | gpu_crack, ctf_tools, ctf_ext | 断点文件：每批落盘一次，中断后续跑 |
+| `--reset-checkpoint` | 开关 | 关 | gpu_crack, ctf_tools, ctf_ext | 忽略已有断点，从头开始 |
 
 > 直接调用模块脚本时，全局参数**必须**写在子命令之前：
 > `python gpu_crack.py --backend numpy --chunk 8192 mtscan ...`
 > 通过统一入口 `ctf.py` 调用时位置随意：`python ctf.py mtscan ... --backend numpy` 亦可。
 
-### 0.3 子命令总表（26 个功能子命令 + 3 个模块自测）
+### 0.3 子命令总表（30 个功能子命令 + 3 个模块自测）
 
 | # | 模块 | 子命令 | 一句话用途 |
 |---|---|---|---|
@@ -48,7 +53,7 @@
 | 8 | ctf_tools | `rs63` | GF(256) RS(63,31) syndrome 校验 / 纠错定位 |
 | 9 | ctf_tools | `crc32` | 批量 CRC32 / 尾部 1~2 字节爆破 |
 | 10 | ctf_tools | `xorbrute` | 重复 XOR 爆破（1~3 字节） |
-| 11 | ctf_tools | `aesctr` | AES-192-CTR 密钥流 / 加解密 |
+| 11 | ctf_tools | `aesctr` | AES-128/192/256-CTR 密钥流 / 加解密 |
 | 12 | ctf_ext | `tea` | TEA / XTEA / XXTEA 加解密 |
 | 13 | ctf_ext | `speck` | Speck32/64、Speck64/128 加解密 |
 | 14 | ctf_ext | `rc4` | RC4 加解密 |
@@ -56,14 +61,18 @@
 | 16 | ctf_ext | `md5` | MD5 哈希 / 口令爆破 |
 | 17 | ctf_ext | `rsa` | RSA 多攻击自动尝试 |
 | 18 | ctf_ext | `encode` | 多层编码 BFS 自动解码 |
-| 19 | ctf_misc | `lsb` | 图像 LSB 位平面穷举提取 |
-| 20 | ctf_misc | `stegscan` | 文件级隐写/附加数据扫描 |
-| 21 | ctf_misc | `imgdiff` | 两图差异包围盒 + 可视化 |
-| 22 | ctf_misc | `bitplane` | 单 bit 平面导出 PNG |
-| 23 | ctf_misc | `cyclic` | pwntools 兼容 de Bruijn 模式生成 |
-| 24 | ctf_misc | `cycfind` | 溢出偏移定位 |
-| 25 | ctf_misc | `gadgets` | ROP gadget 搜索 |
-| 26 | ctf_misc | `elfinfo` | ELF 保护/导入/PLT/GOT 解析 |
+| 19 | ctf_ext | `mdext` | MD5 / SHA-1 哈希长度扩展 |
+| 20 | ctf_ext | `bm` | Berlekamp-Massey 反推 LFSR 多项式 |
+| 21 | ctf_ext | `zipbrute` | ZIP 口令爆破（字典 / 掩码） |
+| 22 | ctf_ext | `eccscan` | ECC 小私钥区间搜索（k·G 匹配公钥） |
+| 23 | ctf_misc | `lsb` | 图像 LSB 位平面穷举提取 |
+| 24 | ctf_misc | `stegscan` | 文件级隐写/附加数据扫描 |
+| 25 | ctf_misc | `imgdiff` | 两图差异包围盒 + 可视化 |
+| 26 | ctf_misc | `bitplane` | 单 bit 平面导出 PNG |
+| 27 | ctf_misc | `cyclic` | pwntools 兼容 de Bruijn 模式生成 |
+| 28 | ctf_misc | `cycfind` | 溢出偏移定位 |
+| 29 | ctf_misc | `gadgets` | ROP gadget 搜索 |
+| 30 | ctf_misc | `elfinfo` | ELF 保护/导入/PLT/GOT 解析 |
 
 另有 3 个模块级自测子命令：`ctf_tools.py selftest`、`ctf_ext.py selftest`、`ctf_misc.py selftest`
 （`gpu_crack.py` 无 selftest 子命令，主框架自测在 `selftest.py`）。
@@ -114,7 +123,7 @@ python ctf.py mtscan --key-hex <1~24B hex> [--seed-start 0] [--seed-count 167772
 - 示例：`python ctf.py mtscan --key-hex ac2f75c043fbc36709d315f2 --seed-start 0 --seed-count 100000000`
 - 备注：命中后会再算一次完整 key 并打印，便于复核。
 
-### 1.3 `sboxscan` — AES-192 S-box 故障枚举
+### 1.3 `sboxscan` — AES-128/192/256 S-box 故障枚举
 
 ```
 python ctf.py sboxscan --plain-hex <16B 倍数> --cipher-hex <等长> --key-hex <24B>
@@ -315,7 +324,7 @@ python ctf.py xorbrute --data-hex <hex> [--max-len 3] [--top 10]
 - 退出码：`0`；`2` 输入错误。
 - 备注：打分=词频权重 + flag 结构（已知前缀重奖）；密文 <8 字节时统计不可靠。
 
-### 2.7 `aesctr` — AES-192-CTR
+### 2.7 `aesctr` — AES-128/192/256-CTR
 
 ```
 python ctf.py aesctr --key-hex <24B> --nonce-hex <8B> [--mode {ks,enc,dec}]
@@ -464,6 +473,79 @@ python ctf.py encode (--data-hex <hex> | --data <原始文本>)
 - 退出码：`0`；`2` 参数错误。
 
 ---
+
+### 3.9 `mdext` — MD5 / SHA-1 哈希长度扩展
+
+```
+python ctf_ext.py mdext --algo md5 --orig-len 23 --digest-hex <32位hex> --append-hex 2661646d696e3d31
+```
+
+| 参数 | 必填 | 默认 | 说明 |
+|---|---|---|---|
+| `--algo` | | `md5` | `md5` / `sha1` |
+| `--orig-len` | ✅ | — | **原消息字节数**（长度扩展的核心输入，错一位结果就废） |
+| `--digest-hex` | ✅ | — | 原摘要：MD5 16 字节 / SHA-1 20 字节 |
+| `--append-hex` | | 空 | 要追加的数据（如 `2661646d696e3d31` = `&admin=1`） |
+
+输出：`glue`（要接在原消息后的填充）、`tail`（glue+append）、`new_digest`、`forged_len`。
+伪造消息 = `原消息 || glue || append`，其摘要即 `new_digest`。
+
+```output
+[mdext/md5] 原长度 23 B，追加 8 B
+  glue        = 80000000000000000000000000000000000000000000000000000000000000000000b800...
+  new_digest  = 3f1c...（32 位 hex）
+```
+
+### 3.10 `bm` — Berlekamp-Massey 反推 LFSR
+
+```
+python ctf_ext.py bm --bits 1000100110101111...
+```
+
+| 参数 | 必填 | 默认 | 说明 |
+|---|---|---|---|
+| `--bits` | ✅ | — | 输出比特流（仅 0/1，至少 2L 位才能唯一确定） |
+
+输出最小多项式 `taps`（`b[n] = Σ c_i·b[n-i]`，tap 从 1 开始）、线性复杂度 `L`、预测下 32 位。
+与 `lfsrscan` 互补：`bm` 已知比特流求抽头，`lfsrscan` 已知抽头扫初始状态。
+
+### 3.11 `zipbrute` — ZIP 口令爆破
+
+```
+python ctf_ext.py zipbrute --zip chal.zip --wordlist rockyou.txt --jobs 8
+python ctf_ext.py zipbrute --zip chal.zip --charset abc123 --min-len 1 --max-len 5
+```
+
+| 参数 | 必填 | 默认 | 说明 |
+|---|---|---|---|
+| `--zip` | ✅ | — | zip 文件路径（取第一个非目录条目） |
+| `--wordlist` | 二选一 | — | 字典文件，每行一个口令，`#` 开头为注释 |
+| `--charset` | 二选一 | — | 掩码字符集（配合 `--min-len`/`--max-len`） |
+| `--min-len` / `--max-len` | | `1` / `4` | 掩码长度区间 |
+| `--jobs` | | `1` | 并行进程数（Windows 上 spawn 开销大，建议 ≤ 8） |
+| `--max-bytes` | | `1048576` | 每个候选最多读取的明文字节（越小越快） |
+
+输出 `/★ 口令 = '...'`；未命中输出 `[zipbrute] 未命中`。仅支持 ZipCrypto/无加密条目
+（WinZip AES 走 PBKDF2，本项目未实现）。
+
+### 3.12 `eccscan` — ECC 小私钥区间搜索
+
+```
+python ctf_ext.py eccscan --curve secp256k1 --pub-hex 04<64位x><64位y> --start 0 --count 1048576
+python ctf_ext.py eccscan --curve p256 --px 0x... --py 0x... --jobs 4
+```
+
+| 参数 | 必填 | 默认 | 说明 |
+|---|---|---|---|
+| `--curve` | | `secp256k1` | `secp256k1` / `p256` |
+| `--pub-hex` | 二选一 | — | 未压缩公钥 `04‖x‖y`（65 字节 hex） |
+| `--px` / `--py` | 二选一 | — | 公钥坐标（十进制 / `0x` / 裸 hex） |
+| `--start` | | `0` | 起始私钥（含） |
+| `--count` | | `1048576` | 搜索个数 |
+| `--jobs` | | `1` | 并行进程数 |
+
+实现：起始点一次标量乘（仿射 + 逆元），之后 Jacobian 混合加法逐点递增 G，
+用交叉相乘 `X == x·Z²`、`Y == y·Z³` 判等，**全程不需逆元**。单核实测约 1.1 M keys/s。
 
 ## 4. `ctf_misc.py` — 取证 & Pwn
 

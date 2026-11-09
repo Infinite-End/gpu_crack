@@ -8,11 +8,11 @@
 
 | 文档属性 | 值 |
 |---|---|
-| 文档版本 | v2.2（2026-11-09） |
+| 文档版本 | v2.3（2026-11-09） |
 | 工具版本 | gpu_crack toolkit v2 |
 | 校验状态 | `ctf.py selftest` 全 PASS；`consistency.py` 32/32；`doc_lint.py` 文档一致性 35 项全 PASS |
 | 适用环境 | Windows + Python 3.15 + torch 2.14.1+cu130（无 torch 时自动回退 numpy） |
-| GitHub | https://github.com/Infinite-End/gpu_crack（**public / MIT**，tag `v2.2`） |
+| GitHub | https://github.com/Infinite-End/gpu_crack（**public / MIT**，tag `v2.3`） |
 | 配套文档 | [CLI_REFERENCE.md](CLI_REFERENCE.md)（**参数/输出/退出码以它为准**）、`skill/SKILL.md` 与 `skill/references/kernels.md` |
 | 许可证 | [MIT](LICENSE) |
 
@@ -33,10 +33,14 @@
 |---|---|---|---|
 | 批量爆破 | `gpu_crack.py` | mt19937 种子、AES S-box 故障、比特一致度、LFSR | `bench` `mtscan` `sboxscan` `ksscore` `lfsrscan` |
 | 密码学 | `ctf_tools.py` | ChaCha20、Poly1305、RS(63,31)、CRC32、XOR、AES-CTR | `chacha` `poly1305` `rs63` `crc32` `xorbrute` `aesctr` |
-| 算法族 | `ctf_ext.py` | TEA/XTEA/XXTEA、Speck、RC4、LCG、MD5、RSA、多层解码 | `tea` `speck` `rc4` `lcg` `md5` `rsa` `encode` |
+| 算法族 | `ctf_ext.py` | TEA/XTEA/XXTEA、Speck、RC4、LCG、MD5、RSA、多层解码、长度扩展、LFSR 反推、ZIP 爆破、ECC 小私钥 | `tea` `speck` `rc4` `lcg` `md5` `rsa` `encode` `mdext` `bm` `zipbrute` `eccscan` |
 | 取证 & Pwn | `ctf_misc.py` | LSB 隐写、文件级 stego、图像差异、位平面、cyclic、ROP、ELF | `lsb` `stegscan` `imgdiff` `bitplane` `cyclic` `cycfind` `gadgets` `elfinfo` |
 
-共 **26 个功能子命令** + 3 个模块级 `selftest`。完整参数说明见 [CLI_REFERENCE.md](CLI_REFERENCE.md)。
+共 **30 个功能子命令** + 3 个模块级 `selftest`。完整参数说明见 [CLI_REFERENCE.md](CLI_REFERENCE.md)。
+
+所有模块共用一套调度/输出参数：`--json`（单行 JSON 结果）、`--quiet`、`--no-progress`、
+`--checkpoint FILE` / `--reset-checkpoint`（断点续跑）。CUDA 显存不足时 `--chunk` 会**自动减半重试**，
+不需要人工调参。
 
 ## 3. 环境与解释器
 
@@ -262,6 +266,20 @@ ct = G.aes192_ecb(blocks, key_t, None, a_idx, b_val)          # blocks/key_t/a_i
 
 ## 12. 变更记录
 
+### v2.3（2026-11-09，本轮：通用调度 + 4 个新内核）
+
+- 新增 `ctf_common.py`：统一分块调度（CUDA OOM 自动减半重试）、进度/ETA、断点续跑、JSON 输出。
+- 新增全局参数：`--json` / `--quiet` / `--no-progress` / `--checkpoint` / `--reset-checkpoint`（gpu_crack、ctf_tools、ctf_ext）。
+- **AES 通用化**：`aes_ecb` 支持 128/192/256（轮数 10/12/14 按密钥长度自动判定），`sboxscan` 与
+  `aesctr` 同步放开密钥长度；`aesctr` 新增 `--nonce-mode le|be` 与 12/16 字节 nonce。
+- 新增 4 个内核（26 → 30 个功能子命令）：
+  - `mdext`：MD5 / SHA-1 哈希长度扩展（纯 Python 压缩函数，自测对拍 hashlib）；
+  - `bm`：Berlekamp-Massey 由比特流反推 LFSR 多项式与线性复杂度；
+  - `zipbrute`：ZIP 口令爆破（字典 / 掩码，多进程）；
+  - `eccscan`：ECC 小私钥区间搜索（secp256k1 / P-256，Jacobian 混合加法 + 交叉相乘判等，单核 ~1.1 M keys/s）。
+- `mtscan` / `sboxscan` / `ksscore` 改走统一调度，获得 OOM 降档、进度 ETA、断点续跑。
+- `doc_lint.py`：子命令清单与计数同步到 30。
+
 ### v2.2（2026-11-09，本轮：skill 部署化 + 可移植性）
 
 - `skill/scripts/ctf.py`：
@@ -292,7 +310,7 @@ ct = G.aes192_ecb(blocks, key_t, None, a_idx, b_val)          # blocks/key_t/a_i
 
 ## 13. GitHub 仓库与跨机使用
 
-- 仓库：https://github.com/Infinite-End/gpu_crack （**public / 开源**），标签 `v2.2`。
+- 仓库：https://github.com/Infinite-End/gpu_crack （**public / 开源**），标签 `v2.3`。
 - 仓库根目录 = 本目录。`skill/` 是 skill 定义（`SKILL.md` / `SKILL.en.md` / `references/kernels.md` / `scripts/ctf.py` / `agents/openai.yaml`）的**同步副本**；
   修改 skill 源后需同步到 `skill/`，`doc_lint.py` 会校验镜像一致性。
 - 在其它机器/其它模型上使用：

@@ -50,6 +50,8 @@ import time
 
 import numpy as np
 
+import ctf_common as C
+
 # ---------------------------------------------------------------- 后端选择
 BACKEND = None
 torch = None
@@ -284,9 +286,12 @@ def _sub_bytes(s, sbox_table, a_idx=None, b_val=None):
 
 
 def _expand_key_np(keybytes):
-    """numpy AES-192 标准 S-box 密钥扩展，返回 [13,16] uint8。"""
-    Nk, Nr = 6, 12
+    """numpy 标准 S-box 密钥扩展（AES-128/192/256），返回 [Nr+1,16] uint8。"""
     kb = np.frombuffer(keybytes, dtype=np.uint8)
+    Nk = len(kb) // 4
+    if Nk not in (4, 6, 8):
+        raise ValueError(f'AES 密钥长度需为 16/24/32 字节，收到 {len(kb)} 字节')
+    Nr = Nk + 6
     w = [kb[4 * i:4 * i + 4].copy() for i in range(Nk)]
     for i in range(Nk, 4 * (Nr + 1)):
         tmp = w[i - 1].copy()
@@ -300,16 +305,21 @@ def _expand_key_np(keybytes):
     return np.concatenate(w, axis=0).reshape(Nr + 1, 16)
 
 
-def aes192_ecb(block, key, sbox_table=None, a_idx=None, b_val=None):
+def aes_ecb(block, key, sbox_table=None, a_idx=None, b_val=None):
     """
-    批量 AES-192 ECB 加密单块（无 padding）。
-    block : [B,16] uint8      key : [16*24] 或 [B,24]
+    批量 AES-128/192/256 ECB 加密单块（无 padding）。
+    block : [B,16] uint8      key : [16|24|32] 或 [B,16|24|32]
     sbox_table : 256 uint8（默认标准 S-box）
     a_idx/b_val: [B,1] 指定"某位置被破坏"（cryp-12025 的 bug 模型）
     返回  : [B,16] uint8
     """
     T = xp()
     is_t = BACKEND.startswith("torch")
+    klen = int(key.shape[1] if key.ndim == 2 else key.shape[0])
+    Nk = klen // 4
+    if Nk not in (4, 6, 8):
+        raise ValueError(f'AES 密钥需 16/24/32 字节，收到 {klen} 字节')
+    Nr = Nk + 6
     if sbox_table is None:
         sbox_table = T.from_numpy(SBOX) if is_t else SBOX
     if is_t:
@@ -320,12 +330,12 @@ def aes192_ecb(block, key, sbox_table=None, a_idx=None, b_val=None):
     fast_rk = None
     if key.ndim == 1:
         kb = from_dev(key).astype(np.uint8).tobytes() if is_t else np.asarray(key, dtype=np.uint8).tobytes()
-        fast_rk = _expand_key_np(kb)                       # [13,16] uint8 ndarray
+        fast_rk = _expand_key_np(kb)                       # [Nr+1,16] uint8 ndarray
         if is_t:
             fast_rk = torch.from_numpy(fast_rk).to(DEV)
         rk_flat = fast_rk.reshape(-1) if is_t else fast_rk.reshape(-1)
         s = block ^ rk_flat[:16]
-        Nr = 12
+        # Nr 已在函数入口按密钥长度算好（128/192/256 → 10/12/14 轮）
         for rnd in range(1, Nr + 1):
             s = _sub_bytes(s, sbox_table, a_idx, b_val)
             if is_t:
@@ -350,8 +360,7 @@ def aes192_ecb(block, key, sbox_table=None, a_idx=None, b_val=None):
     # ---- 通用路径：密钥逐候选不同 ----
     if key.ndim == 1:
         key = key.unsqueeze(0).expand(B, -1) if is_t else np.tile(key, (B, 1))
-    # ---- key expansion（12 轮 → 13 个 round key）----
-    Nk, Nr = 6, 12
+    # ---- key expansion（Nr 轮 → Nr+1 个 round key）----
     w = [key[:, 4 * i:4 * i + 4] for i in range(Nk)]
     for i in range(Nk, 4 * (Nr + 1)):
         tmp = w[i - 1]
@@ -403,6 +412,10 @@ def aes192_ecb(block, key, sbox_table=None, a_idx=None, b_val=None):
 
 
 # ---------------------------------------------------------------- 子命令
+# 兼容旧名：ctf_tools.py 以 24 字节密钥调用，语义不变
+aes192_ecb = aes_ecb
+
+
 def cmd_bench(a):
     T = xp()
     print(f"[backend] {BACKEND}  device={DEV}")
@@ -466,37 +479,36 @@ def cmd_mtscan(a):
     if a.seed_count <= 0:
         print("[错误] --seed-count 必须 > 0", file=sys.stderr)
         return 2
-    step = a.chunk
-    total = 0
-    t0 = time.time()
-    found = []
-    for start in range(a.seed_start, a.seed_start + a.seed_count, step):
-        cnt = min(step, a.seed_start + a.seed_count - start)
-        seeds = (T.arange(start, start + cnt, dtype=T.int64, device=DEV) if BACKEND.startswith("torch")
-                 else np.arange(start, start + cnt, dtype=np.int64))
+    tgt_t = (T.tensor(list(target), dtype=T.uint8, device=DEV) if BACKEND.startswith("torch")
+             else np.frombuffer(target, dtype=np.uint8))
+
+    def _step(lo, hi):
+        cnt = hi - lo
+        seeds = (T.arange(lo, hi, dtype=T.int64, device=DEV) if BACKEND.startswith("torch")
+                 else np.arange(lo, hi, dtype=np.int64))
         keys = mt19937_keys(seeds, twist=(a.twist == 1))[:, :L]
-        tgt = (T.tensor(list(target), dtype=T.uint8, device=DEV) if BACKEND.startswith("torch")
-               else np.frombuffer(target, dtype=np.uint8))
-        eq = (keys == tgt).all(axis=1)
+        eq = (keys == tgt_t).all(axis=1)
+        out = []
         if bool(eq.any()):
             idx = from_dev(eq.nonzero()[0] if BACKEND.startswith("torch") else eq.nonzero()[0])
-            for i in np.atleast_1d(idx):
-                found.append(int(start) + int(i))
-        total += cnt
-        if found:
-            break
-        if total % (step * 20) == 0:
-            rate = total / (time.time() - t0)
-            print(f"  {total:,} seeds  {rate/1e6:.1f} M/s", flush=True)
-    dt = time.time() - t0
-    print(f"[done] {total:,} 个种子 / {dt:.2f}s = {total/dt/1e6:.1f} M seeds/s")
+            out = [int(lo) + int(i) for i in np.atleast_1d(idx)]
+        return cnt, out
+
+    total, found, dt = C.chunked(_step, a.seed_count, start=a.seed_start, chunk=a.chunk,
+                                 label='mtscan', checkpoint=getattr(a, 'checkpoint', ''),
+                                 reset=getattr(a, 'reset_checkpoint', False),
+                                 progress=not getattr(a, 'no_progress', False),
+                                 on_hit=lambda h: True)
+    C.info(f"[done] {total:,} 个种子 / {dt:.2f}s = {total/max(dt,1e-9)/1e6:.1f} M seeds/s")
     if found:
         for s in found:
             k = from_dev(mt19937_keys((T.tensor([s], dtype=T.int64, device=DEV) if BACKEND.startswith("torch")
                                        else np.array([s])), twist=(a.twist == 1))[0])
-            print(f"  ★ 命中 seed={s}  key={bytes(k[:L]).hex()}")
+            C.emit({'event': 'hit', 'kind': 'mtscan', 'seed': s, 'key': bytes(k[:L]).hex(),
+                    'text': f"  ★ 命中 seed={s}  key={bytes(k[:L]).hex()}"})
     else:
-        print("  未命中")
+        C.emit({'event': 'result', 'kind': 'mtscan', 'hits': 0, 'scanned': total,
+                'text': "  未命中"})
 
 
 def cmd_sboxscan(a):
@@ -509,9 +521,8 @@ def cmd_sboxscan(a):
         print(f"[错误] 明文/密文须等长、16 字节整数倍且非空（明文 {len(plain)}B，密文 {len(target)}B）",
               file=sys.stderr)
         return 2
-    if len(key) != 24:
-        print(f"[错误] AES-192 密钥需 24 字节，实际 {len(key)} 字节", file=sys.stderr)
-        return 2
+    if len(key) not in (16, 24, 32):
+        return C.fail(f"AES 密钥需 16/24/32 字节，实际 {len(key)} 字节")
 
     pairs = [(x, y) for x in range(256) for y in range(256) if x != y]
     pairs = np.array(pairs, dtype=np.int64)
@@ -525,11 +536,8 @@ def cmd_sboxscan(a):
     key_t = (T.tensor(list(key), dtype=T.uint8, device=DEV) if BACKEND.startswith("torch")
              else np.frombuffer(key, dtype=np.uint8))
 
-    t0 = time.time()
-    hits = []
-    step = a.chunk
-    for i in range(0, n, step):
-        p = pairs[i:i + step]
+    def _step(lo, hi):
+        p = pairs[lo:hi]
         ai = (T.tensor(p[:, 0], dtype=T.uint8, device=DEV).unsqueeze(1) if BACKEND.startswith("torch")
               else p[:, 0].astype(np.uint8)[:, None])
         bv = (T.tensor(INV_SBOX[p[:, 1]], dtype=T.uint8, device=DEV).unsqueeze(1) if BACKEND.startswith("torch")
@@ -538,12 +546,19 @@ def cmd_sboxscan(a):
             else np.tile(blk0, (p.shape[0], 1))
         out = aes192_ecb(blk, key_t, None, ai, bv)
         eq = (out == tgt0).all(axis=1)
+        got = []
         if bool(eq.any()):
             idx = np.atleast_1d(from_dev(eq.nonzero()[0] if BACKEND.startswith("torch") else eq.nonzero()[0]))
             for j in idx:
-                hits.append((int(p[j][0]), int(p[j][1])))
-    dt = time.time() - t0
-    print(f"[done] {n} 组合 / {dt:.2f}s = {n/dt/1e3:.1f} K/s")
+                got.append([int(p[j][0]), int(p[j][1])])
+        return hi - lo, got
+
+    total, hits, dt = C.chunked(_step, n, chunk=a.chunk, label='sboxscan',
+                                checkpoint=getattr(a, 'checkpoint', ''),
+                                reset=getattr(a, 'reset_checkpoint', False),
+                                progress=not getattr(a, 'no_progress', False))
+    hits = [tuple(h) for h in hits]
+    C.info(f"[done] {total} 组合 / {dt:.2f}s = {total/max(dt,1e-9)/1e3:.1f} K/s")
     # 用全部块验证
     for (x, y) in hits:
         ok = True
@@ -556,9 +571,10 @@ def cmd_sboxscan(a):
             out = from_dev(aes192_ecb(pb, key_t, None, ai, bv))[0]
             if out.tobytes() != target[off:off+16]:
                 ok = False; break
-        print(f"  ★ (a,b)=({x},{y})  全块验证={'通过' if ok else '仅首块'}")
+        C.emit({'event': 'hit', 'kind': 'sboxscan', 'a': x, 'b': y, 'verified': bool(ok),
+                'text': f"  ★ (a,b)=({x},{y})  全块验证={'通过' if ok else '仅首块'}"})
     if not hits:
-        print("  未命中")
+        C.emit({'event': 'result', 'kind': 'sboxscan', 'hits': 0, 'text': "  未命中"})
 
 
 def cmd_ksscore(a):
@@ -574,25 +590,30 @@ def cmd_ksscore(a):
         return 2
     tgt_t = (T.tensor(list(tgt), dtype=T.uint8, device=DEV) if BACKEND.startswith("torch")
              else np.frombuffer(tgt, dtype=np.uint8))
-    total = a.candidates
-    best = (-1, None)
-    t0 = time.time()
-    done = 0
-    step = a.chunk
-    while done < total:
-        cnt = min(step, total - done)
+    best = {'score': -1, 'cand': None}
+
+    def _step(lo, hi):
+        cnt = hi - lo
         cand = (T.randint(0, 256, (cnt, L), dtype=T.int64, device=DEV).to(T.uint8)
                 if BACKEND.startswith("torch") else
                 np.random.randint(0, 256, (cnt, L), dtype=np.uint8))
         sc = bit_agreement(cand, tgt_t)
-        mx = from_dev(sc).max()
-        if mx > best[0]:
-            i = int(np.argmax(from_dev(sc)))
-            best = (int(mx), from_dev(cand)[i].tobytes().hex())
-        done += cnt
-    dt = time.time() - t0
-    print(f"[done] {done:,} 候选 × {L}B / {dt:.2f}s = {done/dt/1e6:.2f} M cand/s")
-    print(f"  最佳比特一致度 {best[0]}/{L*8}   候选 {best[1]}")
+        sc_np = from_dev(sc)
+        mx = int(sc_np.max())
+        if mx > best['score']:
+            i = int(np.argmax(sc_np))
+            best['score'] = mx
+            best['cand'] = from_dev(cand)[i].tobytes().hex()
+        return cnt, []
+
+    done, _hits, dt = C.chunked(_step, a.candidates, chunk=a.chunk, label='ksscore',
+                                checkpoint=getattr(a, 'checkpoint', ''),
+                                reset=getattr(a, 'reset_checkpoint', False),
+                                progress=not getattr(a, 'no_progress', False))
+    C.info(f"[done] {done:,} 候选 × {L}B / {dt:.2f}s = {done/max(dt,1e-9)/1e6:.2f} M cand/s")
+    C.emit({'event': 'result', 'kind': 'ksscore', 'scanned': done, 'bits': L * 8,
+            'best_score': best['score'], 'best_candidate': best['cand'],
+            'text': f"  最佳比特一致度 {best['score']}/{L*8}   候选 {best['cand']}"})
 
 
 def cmd_lfsrscan(a):
@@ -622,7 +643,7 @@ def cmd_lfsrscan(a):
     if a.trials <= 0:
         print("[错误] --trials 必须 > 0", file=sys.stderr)
         return 2
-    print(f"[scan] {len(groups)} 组 LFSR，目标 {len(target_bits)} 拍")
+    C.info(f"[scan] {len(groups)} 组 LFSR，目标 {len(target_bits)} 拍")
 
     rng = np.random.default_rng(a.rng_seed)
     trials = a.trials
@@ -657,9 +678,11 @@ def cmd_lfsrscan(a):
         m = int(from_dev(sc).max())
         if m > best:
             best = m
-        print(f"  组{g+1} (n={n}, taps={taps}): 最佳 {m}/{len(target_bits)} 位")
+        C.emit({'event': 'result', 'kind': 'lfsrscan', 'group': g + 1, 'n': n, 'taps': taps,
+                'best': int(m), 'bits': len(target_bits),
+                'text': f"  组{g+1} (n={n}, taps={taps}): 最佳 {m}/{len(target_bits)} 位"})
     dt = time.time() - t0
-    print(f"[done] {trials*len(groups):,} 组状态 × {len(target_bits)} 拍 / {dt:.2f}s")
+    C.info(f"[done] {trials*len(groups):,} 组状态 × {len(target_bits)} 拍 / {dt:.2f}s")
 
 
 # ---------------------------------------------------------------- CLI
@@ -670,7 +693,9 @@ def main():
     ap.add_argument("--backend", default="auto", choices=["auto", "torch", "numpy"],
                     help="计算后端：auto=torch-cuda→torch-cpu→numpy（默认 auto）")
     ap.add_argument("--chunk", type=int, default=1 << 16,
-                    help="每批候选数（默认 65536；显存不足时减半）")
+                    help="每批候选数（默认 65536；显存不足时自动减半）")
+    C.add_output_args(ap)
+    C.add_sched_args(ap)
     sub = ap.add_subparsers(dest="cmd", required=True, metavar="{bench,mtscan,sboxscan,ksscore,lfsrscan}")
 
     sub.add_parser("bench", help="基准测试：当前机器/后端的吞吐（正式搜索前先跑）")
@@ -698,10 +723,11 @@ def main():
     p.add_argument("--rng-seed", type=int, default=1, help="随机种子，默认 1（双后端结果一致）")
 
     a = ap.parse_args()
+    C.apply_output_args(a)
     if a.chunk < 1:
         ap.error("--chunk 必须 >= 1")
     name, dev = init_backend(a.backend)
-    print(f"[backend] {name}  device={dev}\n")
+    C.info(f"[backend] {name}  device={dev}\n")
     rc = {"bench": cmd_bench, "mtscan": cmd_mtscan, "sboxscan": cmd_sboxscan,
           "ksscore": cmd_ksscore, "lfsrscan": cmd_lfsrscan}[a.cmd](a)
     return int(rc or 0)

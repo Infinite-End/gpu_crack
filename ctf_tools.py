@@ -51,6 +51,7 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import gpu_crack as G                      # noqa: E402
+import ctf_common as C                     # noqa: E402
 
 
 def _T():
@@ -542,27 +543,43 @@ def xorbrute(data, max_len=3, top=10):
 # =====================================================================
 # 6. AES-192 CTR 密钥流
 # =====================================================================
-def aesctr_keystream(key, nonce8, nbytes=64, counter=0):
-    """AES-192-CTR 密钥流（16 字节块，计数器块 = nonce8 || counter64 小端）。"""
-    key, nonce8 = bytes(key), bytes(nonce8)
-    if len(key) != 24:
-        raise ValueError(f'AES-192 密钥必须 24 字节，收到 {len(key)} 字节')
-    if len(nonce8) != 8:
-        raise ValueError(f'CTR 计数器块前缀（nonce）必须 8 字节，收到 {len(nonce8)} 字节')
+def aesctr_keystream(key, nonce, nbytes=64, counter=0, nonce_mode='le'):
+    """AES-128/192/256-CTR 密钥流。
+
+    计数器块构造（按 nonce 长度自动选择）：
+      nonce 8 字节  → nonce || counter(64bit)
+      nonce 12 字节 → nonce || counter(32bit)      （GCM 风格）
+      nonce 16 字节 → 整个块就是计数器，counter 直接加到块上
+    nonce_mode='le'|'be' 控制计数器字节序（8/12 字节模式下生效）。
+    """
+    key, nonce = bytes(key), bytes(nonce)
+    if len(key) not in (16, 24, 32):
+        raise ValueError(f'AES 密钥必须 16/24/32 字节，收到 {len(key)} 字节')
+    if len(nonce) not in (8, 12, 16):
+        raise ValueError(f'nonce 必须 8/12/16 字节，收到 {len(nonce)} 字节')
+    if nonce_mode not in ('le', 'be'):
+        raise ValueError(f"nonce_mode 只能是 'le' 或 'be'，收到 {nonce_mode!r}")
     nbytes, counter = int(nbytes), int(counter)
     if nbytes < 0:
         raise ValueError(f'nbytes 不能为负: {nbytes}')
     blocks = (nbytes + 15) // 16
-    if counter < 0 or counter + max(0, blocks - 1) > (1 << 64) - 1:
+    order = 'little' if nonce_mode == 'le' else 'big'
+    suffix = 16 - len(nonce)
+    limit = 1 << (8 * suffix) if suffix else (1 << 128)
+    if counter < 0 or counter + max(0, blocks - 1) >= limit:
         raise ValueError(f'AES-CTR 计数器越界（counter={counter}, blocks={blocks}）')
     if blocks == 0:
         return b''
     T = _T(); is_t = _is_torch()
-    ctrs = [nonce8 + (counter + i).to_bytes(8, 'little') for i in range(blocks)]
+    if suffix == 0:
+        base = int.from_bytes(nonce, order)
+        ctrs = [((base + counter + i) % limit).to_bytes(16, order) for i in range(blocks)]
+    else:
+        ctrs = [nonce + (counter + i).to_bytes(suffix, order) for i in range(blocks)]
     blk = np.frombuffer(b''.join(ctrs), dtype=np.uint8).reshape(blocks, 16)
     blk_t = T.tensor(blk, dtype=T.uint8, device=_dev()) if is_t else blk
     key_t = T.tensor(list(key), dtype=T.uint8, device=_dev()) if is_t else np.frombuffer(key, dtype=np.uint8)
-    out = G.aes192_ecb(blk_t, key_t)
+    out = G.aes_ecb(blk_t, key_t)
     out = G.from_dev(out).tobytes()
     return out[:nbytes]
 
@@ -772,21 +789,21 @@ def cmd_poly1305(a):
 
 
 def cmd_aesctr(a):
-    """AES-192-CTR 密钥流 / 加解密。"""
+    """AES-128/192/256-CTR 密钥流 / 加解密。"""
     key = _parse_hex(a.key_hex, '--key-hex')
     nonce = _parse_hex(a.nonce_hex, '--nonce-hex')
-    if len(key) != 24:
-        raise ValueError(f'AES-192 密钥必须 24 字节，收到 {len(key)} 字节')
-    if len(nonce) != 8:
-        raise ValueError(f'CTR nonce 必须 8 字节，收到 {len(nonce)} 字节')
+    if len(key) not in (16, 24, 32):
+        raise ValueError(f'AES 密钥必须 16/24/32 字节，收到 {len(key)} 字节')
+    if len(nonce) not in (8, 12, 16):
+        raise ValueError(f'nonce 必须 8/12/16 字节，收到 {len(nonce)} 字节')
     if a.mode == 'ks':
         if a.length < 0:
             raise ValueError(f'--length 不能为负: {a.length}')
-        ks = aesctr_keystream(key, nonce, a.length, a.counter)
+        ks = aesctr_keystream(key, nonce, a.length, a.counter, a.nonce_mode)
         print(f'[aesctr] keystream({a.length}B) = {ks.hex()}')
         return ks
     data = _parse_hex(a.data_hex, '--data-hex') if a.data_hex else b''
-    ks = aesctr_keystream(key, nonce, len(data), a.counter)
+    ks = aesctr_keystream(key, nonce, len(data), a.counter, a.nonce_mode)
     out = bytes(x ^ y for x, y in zip(data, ks))
     print(f'[aesctr/{a.mode}] {out.hex()}')
     if a.out_text:
@@ -881,6 +898,8 @@ def main():
                     help='计算后端：auto=torch-cuda→torch-cpu→numpy（默认 auto）')
     ap.add_argument('--chunk', type=int, default=1 << 14,
                     help='每批候选数（默认 16384，chacha --brute 用）')
+    C.add_output_args(ap)
+    C.add_sched_args(ap)
     sub = ap.add_subparsers(dest='cmd', required=True,
                             metavar='{selftest,chacha,poly1305,rs63,crc32,xorbrute,aesctr}')
     sub.add_parser('selftest', help='已知向量自测（9 项；全 PASS 退出码 0）')
@@ -925,27 +944,30 @@ def main():
                    help='plain=原始 Poly1305（默认）；aead=ChaCha20-Poly1305 tag')
     p.add_argument('--expect-hex', default=None, help='期望 tag（16B hex）；不匹配退出码 1')
 
-    p = sub.add_parser('aesctr', help='AES-192-CTR 密钥流 / 加解密')
-    p.add_argument('--key-hex', required=True, help='24 字节 AES-192 密钥')
-    p.add_argument('--nonce-hex', required=True, help='8 字节 nonce（计数器块 = nonce||counter64 小端）')
+    p = sub.add_parser('aesctr', help='AES-128/192/256-CTR 密钥流 / 加解密')
+    p.add_argument('--key-hex', required=True, help='16/24/32 字节 AES 密钥（128/192/256）')
+    p.add_argument('--nonce-hex', required=True,
+                   help='8 字节（nonce||counter64）、12 字节（GCM 风格 nonce||counter32）或 16 字节整块计数器')
+    p.add_argument('--nonce-mode', default='le', choices=['le', 'be'],
+                   help='计数器字节序：le=小端（默认）/ be=大端')
     p.add_argument('--mode', default='dec', choices=['ks', 'enc', 'dec'],
                    help='ks=输出密钥流；enc/dec=对 --data-hex 异或（默认 dec）')
     p.add_argument('--data-hex', default='', help='enc/dec 模式的输入数据 hex')
     p.add_argument('--length', type=int, default=64, help='ks 模式密钥流字节数，默认 64')
-    p.add_argument('--counter', type=int, default=0, help='起始 64bit 计数器，默认 0')
+    p.add_argument('--counter', type=int, default=0, help='起始计数器，默认 0')
     p.add_argument('--out-text', action='store_true', help='额外打印 text = repr(out)')
 
     a = ap.parse_args()
+    C.apply_output_args(a)
     name, dev = G.init_backend(a.backend)
-    print(f'[backend] {name} device={dev}\n')
+    C.info(f'[backend] {name} device={dev}\n')
     handler = {'selftest': cmd_selftest, 'chacha': cmd_chacha, 'rs63': cmd_rs63,
                'crc32': cmd_crc32, 'xorbrute': cmd_xorbrute,
                'poly1305': cmd_poly1305, 'aesctr': cmd_aesctr}[a.cmd]
     try:
         rc = handler(a)
     except ValueError as e:                     # 参数/输入错误：干净报错，不再抛 traceback
-        print(f'[错误] {e}', file=sys.stderr)
-        return 2
+        return C.fail(str(e), 2)
     return 0 if not isinstance(rc, int) else rc
 
 

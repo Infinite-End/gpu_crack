@@ -54,6 +54,7 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import gpu_crack as G    # noqa: E402
+import ctf_common as C   # noqa: E402
 
 M32 = 0xFFFFFFFF
 
@@ -792,7 +793,472 @@ def cmd_selftest(a):
     ok = bool(got)
     print(f'[自动解码] {"PASS" if ok else "FAIL"}  路径={path} 结果={got[:24] if got else None}')
     fails += not ok
+
+    # MD5 压缩函数（对拍 hashlib）
+    ok = md5_of(b'abc').hex() == '900150983cd24fb0d6963f7d28e17f72'
+    print(f'[MD5 压缩函数] {"PASS" if ok else "FAIL"}')
+    fails += not ok
+
+    # 哈希长度扩展（MD5 / SHA-1）
+    msg = b'user=guest&role=guest'
+    g_md5 = hash_glue('md5', len(msg))
+    ok = hash_extend('md5', len(msg), hashlib.md5(msg).hexdigest(), b'&role=admin')[1] == \
+        hashlib.md5(msg + g_md5 + b'&role=admin').digest()
+    print(f'[MD5 长度扩展] {"PASS" if ok else "FAIL"}')
+    fails += not ok
+    g_sha = hash_glue('sha1', len(msg))
+    ok = hash_extend('sha1', len(msg), hashlib.sha1(msg).hexdigest(), b'&role=admin')[1] == \
+        hashlib.sha1(msg + g_sha + b'&role=admin').digest()
+    print(f'[SHA-1 长度扩展] {"PASS" if ok else "FAIL"}')
+    fails += not ok
+
+    # Berlekamp-Massey：x^4 + x + 1 生成的序列，应还原 taps=[1,0,0,1,1]、L=4
+    seq = [1, 0, 0, 0]
+    for _ in range(40):
+        seq.append(seq[-3] ^ seq[-4])
+    taps, L, _pred = berlekamp_massey(''.join(str(b) for b in seq))
+    ok = L == 4 and taps == [1, 0, 0, 1, 1]
+    print(f'[Berlekamp-Massey] {"PASS" if ok else "FAIL"}  taps={taps} L={L}')
+    fails += not ok
+
+    # ECC：secp256k1 已知私钥 1337，区间内应搜到
+    px, py = ecc_pub('secp256k1', 1337)
+    ok = ecc_search('secp256k1', px, py, 1000, 500, jobs=1) == 1337
+    print(f'[ECC 小私钥搜索] {"PASS" if ok else "FAIL"}')
+    fails += not ok
+
+    # ZIP 爆破骨架：候选生成器正确 + 文件不存在时干净返回 None
+    ok = (list(_gen_candidates('ab', 1, 2)) == [b'a', b'b', b'aa', b'ab', b'ba', b'bb']
+          and _zip_try(('Z:/nonexistent.zip', b'x', 16)) is None)
+    print(f'[ZIP 爆破骨架] {"PASS" if ok else "FAIL"}')
+    fails += not ok
     return fails
+
+
+# =====================================================================
+# 8. 哈希长度扩展（MD5 / SHA-1）
+# =====================================================================
+_MASK32 = 0xFFFFFFFF
+_MD5_K = [int(abs(math.sin(i + 1)) * (1 << 32)) & _MASK32 for i in range(64)]
+_MD5_S = ([7, 12, 17, 22] * 4) + ([5, 9, 14, 20] * 4) + ([4, 11, 16, 23] * 4) + ([6, 10, 15, 21] * 4)
+_MD5_IV = [0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476]
+_SHA1_IV = [0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0]
+HASH_IV = {'md5': _MD5_IV, 'sha1': _SHA1_IV}
+
+
+def _rol32(x, n):
+    x &= _MASK32
+    return ((x << n) | (x >> (32 - n))) & _MASK32
+
+
+def _md5_compress(state, block):
+    """MD5 压缩函数：state 是 4 个 32bit word，block 是 64 字节。"""
+    M = [int.from_bytes(block[i * 4:i * 4 + 4], 'little') for i in range(16)]
+    A, B, C, D = state
+    for i in range(64):
+        if i < 16:
+            F = (B & C) | (~B & _MASK32 & D)
+            g = i
+        elif i < 32:
+            F = (D & B) | (~D & _MASK32 & C)
+            g = (5 * i + 1) % 16
+        elif i < 48:
+            F = B ^ C ^ D
+            g = (3 * i + 5) % 16
+        else:
+            F = C ^ (B | (~D & _MASK32))
+            g = (7 * i) % 16
+        F = (F + A + _MD5_K[i] + M[g]) & _MASK32
+        A, D, C = D, C, B
+        B = (B + _rol32(F, _MD5_S[i])) & _MASK32
+    return [(state[0] + A) & _MASK32, (state[1] + B) & _MASK32,
+            (state[2] + C) & _MASK32, (state[3] + D) & _MASK32]
+
+
+def _sha1_compress(state, block):
+    """SHA-1 压缩函数：state 是 5 个 32bit word，block 是 64 字节。"""
+    w = [int.from_bytes(block[i * 4:i * 4 + 4], 'big') for i in range(16)] + [0] * 64
+    for i in range(16, 80):
+        w[i] = _rol32(w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16], 1)
+    a, b, c, d, e = state
+    for i in range(80):
+        if i < 20:
+            f, k = (b & c) | (~b & _MASK32 & d), 0x5A827999
+        elif i < 40:
+            f, k = b ^ c ^ d, 0x6ED9EBA1
+        elif i < 60:
+            f, k = (b & c) | (b & d) | (c & d), 0x8F1BBCDC
+        else:
+            f, k = b ^ c ^ d, 0xCA62C1D6
+        tmp = (_rol32(a, 5) + f + e + k + w[i]) & _MASK32
+        e, d, c, b, a = d, c, _rol32(b, 30), a, tmp
+    return [(state[0] + a) & _MASK32, (state[1] + b) & _MASK32, (state[2] + c) & _MASK32,
+            (state[3] + d) & _MASK32, (state[4] + e) & _MASK32]
+
+
+def hash_glue(algo, orig_len):
+    """原消息在长度 orig_len 时会补上去的 glue padding（不含消息本身）。"""
+    pad = b'\x80' + b'\x00' * ((56 - (orig_len + 1) % 64) % 64)
+    bits = (orig_len * 8) & 0xFFFFFFFFFFFFFFFF
+    return pad + (bits.to_bytes(8, 'little') if algo == 'md5' else bits.to_bytes(8, 'big'))
+
+
+def hash_extend(algo, orig_len, digest_hex, append):
+    """长度扩展：由 (原长度, 原摘要) 直接算出 (glue, append) 之后的新摘要。
+
+    返回 (glue_bytes, new_digest_bytes)；伪造消息 = 原消息 || glue || append。
+    """
+    algo = algo.lower()
+    if algo not in HASH_IV:
+        raise ValueError(f"algo 只能是 md5 或 sha1，收到 {algo!r}")
+    digest = bytes.fromhex(digest_hex)
+    want = 16 if algo == 'md5' else 20
+    if len(digest) != want:
+        raise ValueError(f'{algo} 摘要必须 {want} 字节，收到 {len(digest)} 字节')
+    order = 'little' if algo == 'md5' else 'big'
+    state = [int.from_bytes(digest[i * 4:i * 4 + 4], order) for i in range(len(digest) // 4)]
+    compress = _md5_compress if algo == 'md5' else _sha1_compress
+    glue = hash_glue(algo, orig_len)
+    total = orig_len + len(glue) + len(append)
+    tail = append + hash_glue(algo, total)
+    if len(tail) % 64:
+        raise AssertionError('padding 异常')
+    for off in range(0, len(tail), 64):
+        state = compress(state, tail[off:off + 64])
+    out = b''.join(x.to_bytes(4, order) for x in state)
+    return glue, out
+
+
+def md5_of(data):
+    """纯 Python MD5（用于自测对拍；正式使用请用 hashlib）。"""
+    state = list(_MD5_IV)
+    full = data + hash_glue('md5', len(data))
+    for off in range(0, len(full), 64):
+        state = _md5_compress(state, full[off:off + 64])
+    return b''.join(x.to_bytes(4, 'little') for x in state)
+
+
+# =====================================================================
+# 9. Berlekamp-Massey（由输出比特反推 LFSR）
+# =====================================================================
+def berlekamp_massey(bits):
+    """返回 (多项式系数 taps, 线性复杂度 L, 预测的下 32 位)。
+
+    bits 只含 0/1；taps 是 [1, c1, c2, ...] 形式（tap 从 1 开始，对应 b[n] = Σ c_i·b[n-i]）。
+    """
+    s = [int(b) & 1 for b in bits]
+    n = len(s)
+    if n == 0:
+        raise ValueError('比特串不能为空')
+    c = [1] + [0] * n
+    b = [1] + [0] * n
+    L, m = 0, -1
+    for i in range(n):
+        d = s[i]
+        for j in range(1, L + 1):
+            d ^= c[j] & s[i - j]
+        if d:
+            t = c[:]
+            shift = i - m
+            for j in range(n - shift + 1):
+                c[j + shift] ^= b[j]
+            if L <= i // 2:
+                L = i + 1 - L
+                m = i
+                b = t
+        if L > 0 and all(x == 0 for x in c[L + 1:]):
+            pass
+    taps = [1] + c[1:L + 1]
+    # 用求出的递推式预测后 32 位
+    seq = s[:]
+    pred = []
+    for _ in range(32):
+        v = 0
+        for j in range(1, L + 1):
+            v ^= taps[j] & seq[len(seq) - j]
+        pred.append(v)
+        seq.append(v)
+    return taps, L, ''.join(str(x) for x in pred)
+
+
+# =====================================================================
+# 10. ZIP 口令爆破（多进程）
+# =====================================================================
+def _zip_try(args):
+    path, cand, max_bytes = args
+    import zipfile
+    try:
+        with zipfile.ZipFile(path) as zf:
+            names = [n for n in zf.namelist() if not n.endswith('/')]
+            if not names:
+                return None
+            with zf.open(names[0], pwd=cand) as fh:
+                fh.read(max_bytes)
+        return cand
+    except (RuntimeError, zipfile.BadZipFile, OSError, NotImplementedError):
+        return None
+
+
+def zip_brute(path, candidates, jobs=1, max_bytes=1 << 20, chunk=256):
+    """对 zip 第一个文件试口令；candidates 是可迭代的 bytes 序列。找到返回口令。"""
+    if jobs <= 1:                                   # 单进程：不起 Pool（Windows 上 spawn 开销很大）
+        for cand in candidates:
+            if _zip_try((path, cand, max_bytes)) is not None:
+                return cand
+        return None
+    import multiprocessing as mp
+    batch = []
+    with mp.Pool(max(1, jobs)) as pool:
+        for cand in candidates:
+            batch.append((path, cand, max_bytes))
+            if len(batch) >= chunk:
+                for hit in pool.imap_unordered(_zip_try, batch, chunksize=8):
+                    if hit is not None:
+                        pool.terminate()
+                        return hit
+                batch = []
+        if batch:
+            for hit in pool.imap_unordered(_zip_try, batch, chunksize=8):
+                if hit is not None:
+                    pool.terminate()
+                    return hit
+    return None
+
+
+# =====================================================================
+# 11. ECC 小私钥搜索（Jacobian 混合加法，无逆元）
+# =====================================================================
+CURVES = {
+    'secp256k1': dict(
+        p=0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F,
+        a=0, b=7,
+        gx=0x79BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798,
+        gy=0x483ADA7726A3C4655DA4FBFC0E1108A8FD17B448A68554199C47D08FFB10D4B8),
+    'p256': dict(
+        p=0xFFFFFFFF00000001000000000000000000000000FFFFFFFFFFFFFFFFFFFFFFFF,
+        a=0xFFFFFFFF00000001000000000000000000000000FFFFFFFFFFFFFFFFFFFFFFFC, b=0x5AC635D8AA3A93E7B3EBBD55769886BC651D06B0CC53B0F63BCE3C3E27D2604B,
+        gx=0x6B17D1F2E12C4247F8BCE6E563A440F277037D812DEB33A0F4A13945D898C296,
+        gy=0x4FE342E2FE1A7F9B8EE7EB4A7C0F9E162BCE33576B315ECECBB6406837BF51F5),
+}
+
+
+def _jac_double(X, Y, Z, p, a):
+    if Y == 0 or Z == 0:
+        return 0, 1, 0
+    YY = Y * Y % p
+    S = 4 * X * YY % p
+    Z2 = Z * Z % p
+    M = (3 * X * X + a * Z2 % p * Z2) % p
+    X3 = (M * M - 2 * S) % p
+    Y3 = (M * (S - X3) - 8 * YY * YY) % p
+    Z3 = 2 * Y * Z % p
+    return X3, Y3, Z3
+
+
+def _jac_add_affine(X1, Y1, Z1, x2, y2, p, a):
+    if Z1 == 0:
+        return x2, y2, 1
+    Z1Z1 = Z1 * Z1 % p
+    U2 = x2 * Z1Z1 % p
+    S2 = y2 * Z1Z1 % p * Z1 % p
+    H = (U2 - X1) % p
+    r = (S2 - Y1) % p
+    if H == 0:
+        if r == 0:
+            return _jac_double(X1, Y1, Z1, p, a)
+        return 0, 1, 0
+    HH = H * H % p
+    HHH = H * HH % p
+    V = X1 * HH % p
+    X3 = (r * r - HHH - 2 * V) % p
+    Y3 = (r * (V - X3) - Y1 * HHH) % p
+    Z3 = Z1 * H % p
+    return X3, Y3, Z3
+
+
+def _ec_affine_add(P, Q, p, a):
+    """仿射点加法（含逆元，仅用于一次性 k·G 计算）。"""
+    if P is None:
+        return Q
+    if Q is None:
+        return P
+    x1, y1 = P
+    x2, y2 = Q
+    if x1 == x2:
+        if (y1 + y2) % p == 0:
+            return None
+        lam = (3 * x1 * x1 + a) * pow(2 * y1 % p, -1, p) % p
+    else:
+        lam = (y2 - y1) * pow((x2 - x1) % p, -1, p) % p
+    x3 = (lam * lam - x1 - x2) % p
+    return x3, (lam * (x1 - x3) - y1) % p
+
+
+def _ec_base_mul(k, p, a, gx, gy):
+    """k·G → Jacobian (X, Y, Z)（一次性标量乘，内部用仿射 + 逆元，只有 256 步）。"""
+    k %= p
+    G = (gx, gy)
+    R = None
+    add = G
+    while k:
+        if k & 1:
+            R = _ec_affine_add(R, add, p, a)
+        add = _ec_affine_add(add, add, p, a)
+        k >>= 1
+    if R is None:
+        return 0, 1, 0
+    return R[0], R[1], 1
+
+
+def _ecc_worker(job):
+    """在一个小片内顺序搜索：返回命中的 k 或 None。"""
+    curve, lo, cnt, tx, ty = job
+    c = CURVES[curve]
+    p, a = c['p'], c['a']
+    X, Y, Z = _ec_base_mul(lo, p, a, c['gx'], c['gy'])
+    for i in range(cnt):
+        if Z:
+            Z2 = Z * Z % p
+            if X == tx * Z2 % p and Y == ty * Z2 % p * Z % p:
+                return lo + i
+        X, Y, Z = _jac_add_affine(X, Y, Z, c['gx'], c['gy'], p, a)
+    return None
+
+
+def ecc_search(curve, tx, ty, start, count, jobs=1, chunk=20000):
+    """在 [start, start+count) 里找 k 使 k·G == (tx, ty)。"""
+    import multiprocessing as mp
+    if jobs <= 1:
+        return _ecc_worker((curve, start, count, tx, ty))
+    per = max(1, count // (jobs * 4))
+    jobs_list = []
+    k = start
+    end = start + count
+    while k < end:
+        n = min(per, end - k)
+        jobs_list.append((curve, k, n, tx, ty))
+        k += n
+    with mp.Pool(jobs) as pool:
+        for hit in pool.imap_unordered(_ecc_worker, jobs_list):
+            if hit is not None:
+                pool.terminate()
+                return hit
+    return None
+
+
+def ecc_pub(curve, k):
+    """k·G 的仿射坐标（自测/构造用）。"""
+    c = CURVES[curve]
+    p = c['p']
+    X, Y, Z = _ec_base_mul(k % p, p, c['a'], c['gx'], c['gy'])
+    zi = pow(Z, -1, p)
+    return X * zi * zi % p, Y * zi * zi % p * zi % p
+
+
+def cmd_mdext(a):
+    """哈希长度扩展：已知 (原长度, 原摘要)，构造 原消息||glue||append 的合法摘要。"""
+    append = _hex_arg(a.append_hex, '--append-hex') if a.append_hex else b''
+    glue, new = hash_extend(a.algo, a.orig_len, a.digest_hex, append)
+    C.emit({'event': 'result', 'kind': 'mdext', 'algo': a.algo, 'orig_len': a.orig_len,
+            'glue': glue.hex(), 'tail': (glue + append).hex(), 'new_digest': new.hex(),
+            'forged_len': a.orig_len + len(glue) + len(append),
+            'text': f'[mdext/{a.algo}] 原长度 {a.orig_len} B，追加 {len(append)} B\n'
+                    f'  glue        = {glue.hex()}\n'
+                    f'  tail        = {(glue + append).hex()}\n'
+                    f'  new_digest  = {new.hex()}\n'
+                    f'  forged_len  = {a.orig_len + len(glue) + len(append)}'})
+    return new.hex()
+
+
+def cmd_bm(a):
+    """Berlekamp-Massey：由输出比特反推 LFSR 多项式与线性复杂度。"""
+    bits = a.bits.strip()
+    if not bits or set(bits) - set('01'):
+        return _err('--bits 只能是 0/1 组成的比特串')
+    taps, L, pred = berlekamp_massey(bits)
+    C.emit({'event': 'result', 'kind': 'bm', 'bits': len(bits), 'linear_complexity': L,
+            'taps': taps, 'next32': pred,
+            'text': f'[bm] 输入 {len(bits)} 位，线性复杂度 L={L}\n'
+                    f'  taps = {taps}   （b[n] = Σ c_i·b[n-i]，tap 从 1 开始）\n'
+                    f'  预测下 32 位 = {pred}'})
+    return taps
+
+
+def _gen_candidates(charset, min_len, max_len):
+    for n in range(min_len, max_len + 1):
+        for tup in itertools.product(charset, repeat=n):
+            yield ''.join(tup).encode()
+
+
+def cmd_zipbrute(a):
+    """ZIP 口令爆破：字典或字符集掩码。"""
+    if not os.path.exists(a.zip):
+        return _err(f'找不到 zip 文件: {a.zip}')
+    if a.wordlist:
+        if not os.path.exists(a.wordlist):
+            return _err(f'找不到字典文件: {a.wordlist}')
+
+        def cands():
+            with open(a.wordlist, 'rb') as fh:
+                for line in fh:
+                    c = line.rstrip(b'\r\n')
+                    if c and not c.startswith(b'#'):
+                        yield c
+    else:
+        if not a.charset:
+            return _err('需要 --wordlist，或给 --charset 做掩码爆破')
+        if a.min_len < 1 or a.max_len < a.min_len:
+            return _err(f'长度区间非法：min={a.min_len} max={a.max_len}')
+
+        def cands():
+            yield from _gen_candidates(a.charset, a.min_len, a.max_len)
+
+    t0 = time.time()
+    got = zip_brute(a.zip, cands(), jobs=a.jobs, max_bytes=a.max_bytes)
+    dt = time.time() - t0
+    if got is None:
+        C.emit({'event': 'result', 'kind': 'zipbrute', 'found': False,
+                'text': f'[zipbrute] 未命中（{dt:.2f}s）'})
+        return None
+    try:
+        shown = got.decode('utf-8')
+    except UnicodeDecodeError:
+        shown = got.decode('latin-1')
+    C.emit({'event': 'hit', 'kind': 'zipbrute', 'password': shown, 'elapsed': round(dt, 3),
+            'text': f'[zipbrute] ★ 口令 = {shown!r}  （{dt:.2f}s）'})
+    return shown
+
+
+def cmd_eccscan(a):
+    """ECC 小私钥搜索：在指定区间内找 k 使 k·G 等于给定公钥。"""
+    if a.pub_hex:
+        raw = _hex_arg(a.pub_hex, '--pub-hex')
+        if len(raw) != 65 or raw[0] != 4:
+            return _err(f'--pub-hex 需 65 字节未压缩公钥（04||x||y），收到 {len(raw)} 字节')
+        tx = int.from_bytes(raw[1:33], 'big')
+        ty = int.from_bytes(raw[33:65], 'big')
+    elif a.px and a.py:
+        tx, ty = _parse_int(a.px), _parse_int(a.py)
+    else:
+        return _err('需要 --pub-hex，或同时给 --px/--py')
+    if a.count <= 0:
+        return _err('--count 必须 > 0')
+    curve = a.curve
+    if curve not in CURVES:
+        return _err(f'未知曲线 {curve}；可选: {", ".join(CURVES)}')
+    t0 = time.time()
+    k = ecc_search(curve, tx, ty, a.start, a.count, jobs=a.jobs)
+    dt = time.time() - t0
+    rate = a.count / max(dt, 1e-9)
+    C.info(f'[eccscan] {curve}  搜索 [{a.start}, {a.start + a.count})  '
+           f'{dt:.2f}s  {rate/1e3:.0f} K/s')
+    if k is None:
+        C.emit({'event': 'result', 'kind': 'eccscan', 'curve': curve, 'found': False,
+                'scanned': a.count, 'text': '  未命中'})
+        return None
+    C.emit({'event': 'hit', 'kind': 'eccscan', 'curve': curve, 'private_key': k,
+            'private_key_hex': hex(k), 'text': f'  ★ 私钥 k = {k}  (0x{k:x})'})
+    return k
 
 
 def cmd_tea(a):
@@ -931,6 +1397,8 @@ def main():
         description='ctf_ext — CTF 算法族内核（完整说明见 CLI_REFERENCE.md）')
     ap.add_argument('--backend', default='auto', choices=['auto', 'torch', 'numpy'],
                     help='计算后端：auto=torch-cuda→torch-cpu→numpy（默认 auto）')
+    C.add_output_args(ap)
+    C.add_sched_args(ap)
     sub = ap.add_subparsers(dest='cmd', required=True,
                             metavar='{selftest,tea,speck,rc4,lcg,md5,rsa,encode}')
     sub.add_parser('selftest', help='已知向量自测（失败时退出码=失败项数）')
@@ -975,10 +1443,40 @@ def main():
     enc.add_argument('--data-hex', help='数据以裸 hex 给出')
     enc.add_argument('--data', help='数据以原始文本给出（UTF-8）')
 
+    p = sub.add_parser('mdext', help='MD5 / SHA-1 哈希长度扩展')
+    p.add_argument('--algo', default='md5', choices=['md5', 'sha1'], help='哈希算法，默认 md5')
+    p.add_argument('--orig-len', type=int, required=True, help='原消息字节数（关键：必须准确）')
+    p.add_argument('--digest-hex', required=True, help='原摘要（16 或 20 字节 hex）')
+    p.add_argument('--append-hex', default='', help='要追加的数据 hex（如 2661646d696e3d31）')
+
+    p = sub.add_parser('bm', help='Berlekamp-Massey：由输出比特反推 LFSR 多项式')
+    p.add_argument('--bits', required=True, help='输出比特流，仅含 0/1')
+
+    p = sub.add_parser('zipbrute', help='ZIP 口令爆破（字典或字符集掩码）')
+    p.add_argument('--zip', required=True, help='zip 文件路径')
+    p.add_argument('--wordlist', help='字典文件：每行一个候选口令（# 开头为注释）')
+    p.add_argument('--charset', help='字符集掩码爆破（如 abc0123）')
+    p.add_argument('--min-len', type=int, default=1, help='掩码最小长度，默认 1')
+    p.add_argument('--max-len', type=int, default=4, help='掩码最大长度，默认 4')
+    p.add_argument('--jobs', type=int, default=1, help='并行进程数，默认 1（Windows 上 spawn 开销大）')
+    p.add_argument('--max-bytes', type=int, default=1 << 20, help='每个候选最多读取的明文字节，默认 1 MiB')
+
+    p = sub.add_parser('eccscan', help='ECC 小私钥搜索：区间内找 k 使 k·G 等于给定公钥')
+    p.add_argument('--curve', default='secp256k1', choices=sorted(CURVES), help='曲线，默认 secp256k1')
+    p.add_argument('--pub-hex', help='未压缩公钥 04||x||y（65 字节 hex）')
+    p.add_argument('--px', help='公钥 x（十进制/0x/裸 hex）')
+    p.add_argument('--py', help='公钥 y（十进制/0x/裸 hex）')
+    p.add_argument('--start', type=int, default=0, help='起始私钥（含），默认 0')
+    p.add_argument('--count', type=int, default=1 << 20, help='搜索个数，默认 1048576')
+    p.add_argument('--jobs', type=int, default=1, help='并行进程数，默认 1')
+
     a = ap.parse_args()
+    C.apply_output_args(a)
     G.init_backend(a.backend)
     rc = {'selftest': cmd_selftest, 'tea': cmd_tea, 'speck': cmd_speck, 'rc4': cmd_rc4,
-          'lcg': cmd_lcg, 'md5': cmd_md5, 'rsa': cmd_rsa, 'encode': cmd_encode}[a.cmd](a)
+          'lcg': cmd_lcg, 'md5': cmd_md5, 'rsa': cmd_rsa, 'encode': cmd_encode,
+          'mdext': cmd_mdext, 'bm': cmd_bm, 'zipbrute': cmd_zipbrute,
+          'eccscan': cmd_eccscan}[a.cmd](a)
     # 只有 selftest 会返回 int（失败项数，便于上层集成脚本判断）；其余命令返回 None = 成功
     sys.exit(0 if not isinstance(rc, int) else rc)
 

@@ -53,7 +53,8 @@ def run(args, timeout=300):
 
 SCRIPTS = {'gpu_crack.py': ['bench', 'mtscan', 'sboxscan', 'ksscore', 'lfsrscan'],
            'ctf_tools.py': ['selftest', 'chacha', 'poly1305', 'rs63', 'crc32', 'xorbrute', 'aesctr'],
-           'ctf_ext.py': ['selftest', 'tea', 'speck', 'rc4', 'lcg', 'md5', 'rsa', 'encode'],
+           'ctf_ext.py': ['selftest', 'tea', 'speck', 'rc4', 'lcg', 'md5', 'rsa', 'encode',
+                          'mdext', 'bm', 'zipbrute', 'eccscan'],
            'ctf_misc.py': ['selftest', 'lsb', 'stegscan', 'imgdiff', 'bitplane', 'cyclic', 'cycfind',
                            'gadgets', 'elfinfo']}
 FLAG_RE = re.compile(r'--[a-zA-Z][a-zA-Z0-9-]*')
@@ -109,8 +110,8 @@ kern = doc_text.get(os.path.join(SKILL, 'references', 'kernels.md'), '')
 missing_ref = [s for s in functional if ('`%s`' % s) not in cli_ref]
 missing_kern = [s for s in functional
                 if not re.search(r'(?<![\w-])%s(?![\w-])' % re.escape(s), kern)]
-check('CLI_REFERENCE lists all 26 functional subcommands', not missing_ref, missing_ref)
-check('kernels.md lists all 26 functional subcommands', not missing_kern, missing_kern)
+check('CLI_REFERENCE lists all 30 functional subcommands', not missing_ref, missing_ref)
+check('kernels.md lists all 30 functional subcommands', not missing_kern, missing_kern)
 
 # ---------- 5. 引用的本地文件存在 ----------
 file_refs = set()
@@ -144,11 +145,11 @@ for p in DOCS + [os.path.join(ROOT, f) for f in SCRIPTS] + [CTF]:
 
 # ---------- 7. 关键章节 ----------
 for p, text in doc_text.items():
-    check('has version header: ' + os.path.basename(p), ('v2.2' in text) or ('v2.1' in text) or ('v1.0' in text))
+    check('has version header: ' + os.path.basename(p), ('v2.3' in text) or ('v2.2' in text) or ('v2.1' in text) or ('v1.0' in text))
 for token in ('退出码矩阵', '稳定契约', '★', 'UTF-8'):
     check('CLI_REFERENCE contains ' + token, token in cli_ref)
-check('CLI_REFERENCE count 26', '26 个功能子命令' in cli_ref)
-check('README count 26', '26 个功能子命令' in doc_text.get(os.path.join(ROOT, 'README.md'), ''))
+check('CLI_REFERENCE count 30', '30 个功能子命令' in cli_ref)
+check('README count 30', '30 个功能子命令' in doc_text.get(os.path.join(ROOT, 'README.md'), ''))
 
 # ---------- 8. 统一入口 help ----------
 rc, out = run([CTF, 'help'])

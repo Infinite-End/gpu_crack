@@ -35,11 +35,16 @@ does wins. If none qualifies, the current interpreter is used and GPU kernels fa
 |---|---|
 | unknown stream cipher, many candidate keys | `mtscan` (mt19937 seed), `sboxscan`, `ksscore`, `lfsrscan` |
 | ChaCha20 keystream, Poly1305 tag, RC4, AES-CTR | `chacha`, `poly1305`, `rc4`, `aesctr` |
+| AES-Sbox fault analysis | `sboxscan` (128/192/256-bit keys) |
 | Reed-Solomon / error-correcting code over GF(256) | `rs63` |
 | repeating-XOR or single-byte XOR ciphertext | `xorbrute` |
 | TEA/XTEA/XXTEA/Speck encrypted blob | `tea`, `speck` |
 | pseudo-random outputs to predict | `lcg`, then `mtscan` |
 | MD5 hash to crack | `md5` |
+| forge a MAC/signature over an extended message | `mdext` (MD5 / SHA-1 length extension) |
+| output bitstream, unknown LFSR taps | `bm` (Berlekamp-Massey) |
+| encrypted ZIP | `zipbrute` (wordlist or mask) |
+| ECC public key with a small private key | `eccscan` (secp256k1 / P-256, ~1.1 M keys/s per core) |
 | RSA modulus + ciphertext, unknown attack | `rsa` (tries five attacks in cost order) |
 | unknown encoding layers | `encode`, `crc32` |
 | image with suspected LSB stego | `stegscan` then `lsb` |
@@ -71,8 +76,10 @@ python scripts/ctf.py lsb --img chal.png
 python scripts/ctf.py gadgets --file vuln --filter "syscall"
 ```
 
-Global options `--backend auto|torch|numpy` and `--chunk N` may appear before or after the module name
-(the dispatcher moves them where argparse needs them); `ctf_misc.py` is pure CPU and ignores them.
+Global options work before or after the module name: `--backend auto|torch|numpy`, `--chunk N`
+(OOM halves it automatically), `--json` (one-line JSON result), `--quiet`, `--no-progress`,
+`--checkpoint FILE` / `--reset-checkpoint` (resumable scans). `ctf_misc.py` is pure CPU and
+accepts none of them.
 
 ## 4. Output contract (parse only these)
 

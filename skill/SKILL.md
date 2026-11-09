@@ -1,4 +1,4 @@
----
+﻿---
 name: ctf-toolkit
 description: GPU-accelerated, command-line CTF toolkit in this repository for batch brute-force and triage (MT19937 seed scan, AES S-box fault scan, ChaCha20/RC4/AES-CTR keystream, RS(63,31) syndrome, TEA/XTEA/XXTEA/Speck, LCG recovery, MD5 cracking, RSA multi-attack, multi-layer decoding, image LSB/stegscan, image diff, ROP gadgets, ELF recon, cyclic offsets). Use when a CTF task requires trying many candidates at once, identifying an unknown cipher, recovering keys/keystreams, extracting hidden data from images or files, or computing pwn offsets and gadgets.
 ---
@@ -7,7 +7,7 @@ description: GPU-accelerated, command-line CTF toolkit in this repository for ba
 
 | 文档属性 | 值 |
 |---|---|
-| 文档版本 | v2.2（2026-11-09） |
+| 文档版本 | v2.3（2026-11-09） |
 | 适用工具 | gpu_crack toolkit v2（仓库根目录） |
 | 校验状态 | `ctf.py selftest` 全 PASS；`consistency.py` 32/32 |
 | 配套文档 | `CLI_REFERENCE.md`（仓库根，规范性参数/输出/退出码）、`README.md`（仓库根）、`references/kernels.md`、`SKILL.en.md`（英文精简版） |
@@ -25,7 +25,8 @@ description: GPU-accelerated, command-line CTF toolkit in this repository for ba
 | 统一入口 | `scripts/ctf.py`（本 skill 内） |
 | 参考文档 | `<skill>/references/kernels.md`（一页速查）、`CLI_REFERENCE.md`（完整参数/输出/退出码） |
 | 后端 | `--backend auto|torch|numpy`；`ctf_misc.py` 纯 CPU，无此参数 |
-| 分块 | `--chunk N`（gpu_crack 默认 65536、ctf_tools 默认 16384；OOM 时减半） |
+| 分块 | `--chunk N`（gpu_crack 默认 65536、ctf_tools 默认 16384；**OOM 自动减半重试**） |
+| 输出/调度 | `--json`（单行 JSON 结果）、`--quiet`、`--no-progress`、`--checkpoint FILE`、`--reset-checkpoint`（后五项 gpu_crack / ctf_tools / ctf_ext 支持，ctf_misc 不支持） |
 
 统一入口会自动挑解释器、把全局参数挪到正确位置。不确定时**优先用统一入口**：
 
@@ -64,15 +65,19 @@ python $ctf <子命令> --help
 | 未知流密码、大量候选密钥 | `mtscan`（mt19937 种子） | `chacha`、`ksscore` |
 | ChaCha20 密钥流/Poly1305 tag | `chacha`、`poly1305` | — |
 | 弱密钥、种子空间小 | `mtscan` | `sboxscan` |
-| AES S-box 故障攻击 | `sboxscan` | — |
+| AES S-box 故障攻击 | `sboxscan`（支持 128/192/256 密钥） | — |
 | Reed-Solomon / GF(256) 码 | `rs63` | — |
 | 重复 XOR / 单字节 XOR | `xorbrute` | — |
-| AES-CTR 流 | `aesctr` | — |
+| AES-CTR 流 | `aesctr`（128/192/256，`--nonce-mode le/be`） | — |
 | TEA/XTEA/XXTEA/Speck/RC4 | `tea`、`speck`、`rc4` | `xorbrute`（若怀疑被 XOR） |
 | 伪随机输出预测 | `lcg` | `mtscan`（mt19937） |
 | MD5 口令 | `md5` | — |
 | RSA 模数+密文 | `rsa`（五连攻击） | 库函数共模/广播 |
 | 未知编码层 | `encode` | — |
+| 哈希长度扩展（伪造 MAC/签名） | `mdext`（MD5 / SHA-1） | — |
+| 只有输出比特流，要反推 LFSR | `bm`（Berlekamp-Massey） | `lfsrscan`（已知抽头时） |
+| 加密 ZIP 口令 | `zipbrute`（字典/掩码） | — |
+| 已知 ECC 公钥、私钥很小 | `eccscan`（secp256k1 / P-256） | — |
 | 图片 LSB 隐写 | `lsb` | `stegscan` |
 | 文件附加/内嵌数据 | `stegscan` | — |
 | 两图差异 | `imgdiff` | `bitplane` |

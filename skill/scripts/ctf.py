@@ -99,6 +99,8 @@ SCRIPTS = {
     'crc32': 'ctf_tools.py', 'xorbrute': 'ctf_tools.py', 'aesctr': 'ctf_tools.py',
     'tea': 'ctf_ext.py', 'speck': 'ctf_ext.py', 'rc4': 'ctf_ext.py', 'lcg': 'ctf_ext.py',
     'md5': 'ctf_ext.py', 'rsa': 'ctf_ext.py', 'encode': 'ctf_ext.py',
+    'mdext': 'ctf_ext.py', 'bm': 'ctf_ext.py', 'zipbrute': 'ctf_ext.py',
+    'eccscan': 'ctf_ext.py',
     'lsb': 'ctf_misc.py', 'stegscan': 'ctf_misc.py', 'imgdiff': 'ctf_misc.py',
     'bitplane': 'ctf_misc.py', 'cyclic': 'ctf_misc.py', 'cycfind': 'ctf_misc.py',
     'gadgets': 'ctf_misc.py', 'elfinfo': 'ctf_misc.py',
@@ -185,7 +187,11 @@ def pick_python() -> str:
     return sys.executable
 
 
-GLOBAL_OPTS = ('--backend', '--chunk')
+# 需要带值的全局选项（--opt VALUE 或 --opt=VALUE）
+GLOBAL_VALUED = ('--backend', '--chunk', '--checkpoint')
+# 开关型全局选项（不带值）
+GLOBAL_FLAGS = ('--json', '--quiet', '--no-progress', '--reset-checkpoint')
+GLOBAL_OPTS = GLOBAL_VALUED + GLOBAL_FLAGS
 
 # 每个脚本支持的全局选项（ctf_misc.py 是纯 CPU 的 PIL/capstone 工具，没有这些参数）
 GLOBALS_OF = {
@@ -197,13 +203,13 @@ GLOBALS_OF = {
 
 
 def filter_globals(gl, allowed):
-    """按目标脚本支持的选项过滤全局参数，返回 (保留, 丢弃)。"""
+    """按目标脚本支持的选项过滤全局参数，返回 (保留, 丢弃)。开关型选项不吞下一个参数。"""
     keep, drop = [], []
     i = 0
     while i < len(gl):
         opt = gl[i].split('=', 1)[0]
         tgt = keep if opt in allowed else drop
-        if '=' in gl[i] or i + 1 >= len(gl):
+        if opt in GLOBAL_FLAGS or '=' in gl[i] or i + 1 >= len(gl):
             tgt.append(gl[i]); i += 1
         else:
             tgt.extend(gl[i:i + 2]); i += 2
@@ -213,20 +219,24 @@ def filter_globals(gl, allowed):
 
 def split_globals(args):
     """
-    把模块级全局参数（--backend / --chunk）提到子命令之前。
+    把模块级全局参数（--backend / --chunk / --json / --quiet / ...）提到子命令之前。
     argparse 要求全局选项出现在子命令前面，否则子命令会报 unrecognized arguments。
+    开关型选项（不带值）只搬它自己，避免吞掉后面的子命令名。
     """
     head, tail = [], []
     i = 0
     while i < len(args):
-        if args[i] in GLOBAL_OPTS:
+        opt = args[i].split('=', 1)[0]
+        if opt in GLOBAL_FLAGS:
             head.append(args[i])
-            if i + 1 < len(args):
+            i += 1
+            continue
+        if opt in GLOBAL_VALUED:
+            head.append(args[i])
+            if '=' not in args[i] and i + 1 < len(args):
                 head.append(args[i + 1])
                 i += 2
                 continue
-        elif any(args[i].startswith(o + '=') for o in GLOBAL_OPTS):
-            head.append(args[i])
         else:
             tail.append(args[i])
         i += 1
@@ -254,15 +264,20 @@ def main() -> int:
     # 允许 `ctf.py --backend numpy <module>` 这种写法：先吃掉最前面的全局选项
     gl_front, i = [], 0
     while i < len(argv):
-        if argv[i] in GLOBAL_OPTS:
-            if i + 1 >= len(argv):
-                print(f'[错误] {argv[i]} 缺少取值', file=sys.stderr)
-                return 2
-            gl_front += [argv[i], argv[i + 1]]
-            i += 2
-        elif any(argv[i].startswith(o + '=') for o in GLOBAL_OPTS):
+        opt = argv[i].split('=', 1)[0]
+        if opt in GLOBAL_FLAGS:                  # 开关型：只搬自己，别吞掉后面的模块名
             gl_front.append(argv[i])
             i += 1
+        elif opt in GLOBAL_VALUED:
+            if '=' in argv[i]:
+                gl_front.append(argv[i])
+                i += 1
+            elif i + 1 >= len(argv):
+                print(f'[错误] {argv[i]} 缺少取值', file=sys.stderr)
+                return 2
+            else:
+                gl_front += [argv[i], argv[i + 1]]
+                i += 2
         else:
             break
     argv = argv[i:]
