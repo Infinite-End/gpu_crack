@@ -9,7 +9,7 @@ ctf_ext.py — CTF 算法族内核（与 gpu_crack.py 共用后端）
   speck      Speck32/64、Speck64/128、Speck128/128·192·256 加解密（NSA 组合 16/4、32/3、32/4、64/2、64/3、64/4）
   rc4        RC4 加解密（key 1~256B）
   lcg        LCG 参数恢复 / 状态预测（--mod 支持 2**32 等表达式）
-  md5        MD5 批量哈希 / 口令爆破（含空口令）
+  md5        MD5 批量哈希 / 口令爆破（含空口令；torch-cuda 下爆破走 GPU 批处理，无 CUDA 自动回退 hashlib）
   rsa        RSA 多攻击自动尝试：小因子 → Wiener → Fermat → rho → p-1（结果经 m^e≡c 校验）
   encode     多层编码 BFS 自动解码（hex/b64/b32/url/rot13/rot47/反转/单字节 XOR）
   selftest   已知向量自测（失败时退出码 = 失败项数）
@@ -367,20 +367,311 @@ def lcg_predict(outputs, modulus, n=1):
 
 
 # =====================================================================
-# MD5（批量）
+# MD5（批量 / 口令爆破：hashlib CPU 路径 + torch-cuda 批处理路径）
 # =====================================================================
 _MD5_S = [7,12,17,22]*4 + [5,9,14,20]*4 + [4,11,16,23]*4 + [6,10,15,21]*4
 _MD5_K = [int(abs(math.sin(i + 1)) * 2**32) & M32 for i in range(64)]
+_MD5_IV = [0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476]
+
+# GPU 路径参数（取值依据见 reports/opt-ext.md 的实测交叉点/调参）
+_MD5_GPU_MIN_WORK = 2_000_000      # 有效候选数（min(空间, limit)）达到该值才值得走 GPU
+_MD5_GPU_CHUNK_1 = 1 << 20         # 单 64B 块候选的分块大小（实测最优）
+_MD5_GPU_CHUNK_2 = 1 << 19         # 跨 2 个 64B 块候选的分块大小
+_MD5_GPU_MAX_BYTES = 119           # GPU 路径支持的消息字节数上限（padding 后正好 ≤2 块）
 
 
 def md5_batch(msgs):
-    """批量 MD5：msgs 为 list[bytes]，返回 list[bytes]（16 字节）。用 hashlib（C 实现已足够快）。"""
+    """批量 MD5：msgs 为 list[bytes]，返回 list[bytes]（16 字节）。
+
+    用 hashlib（C 实现已很快）；爆破路径才有 GPU 批处理，批量哈希不在此增强（见 opt-ext 报告）。
+    """
     return [hashlib.md5(m).digest() for m in msgs]
 
 
-def md5_crack(target_hex, charset, max_len, limit=None):
-    """暴力 MD5（长度 0 ≤ L ≤ max_len）。返回命中的明文。"""
-    tgt = bytes.fromhex(target_hex)
+# ---------------------------------------------------------------- MD5 GPU 内核
+def _i32(v):
+    """无符号 32bit 常量 -> int32 补码（torch.int32 的加减/异或按 2^32 回绕）。"""
+    return v - (1 << 32) if v >= (1 << 31) else v
+
+
+_MD5_GPU_T = None
+_MD5_GPU_DEV = None
+
+
+def _md5_gpu_backend():
+    """探测 torch-cuda 后端：返回 True/False，并把 torch 模块/设备缓存到模块级。
+
+    不硬依赖 gpu_crack 内部 torch 引用的具体形式（该模块可能做惰性/重构）：
+    - 显式 --backend numpy（G.BACKEND == 'numpy'）一定不走 GPU；
+    - 其它情况（auto/torch/未初始化）尝试使用 G.torch，必要时直接 import torch；
+    - 仅当 CUDA 可用时返回 True。
+    """
+    global _MD5_GPU_T, _MD5_GPU_DEV
+    backend = str(getattr(G, 'BACKEND', '') or '')
+    if backend == 'numpy':
+        return False
+    if _MD5_GPU_T is not None and _MD5_GPU_DEV is not None:
+        return True
+    T = getattr(G, 'torch', None)
+    if T is None:
+        try:
+            import torch as T
+        except Exception:
+            return False
+    try:
+        if not T.cuda.is_available():
+            return False
+        dev = getattr(G, 'DEV', None)
+        if dev is None or T.device(dev).type != 'cuda':
+            dev = T.device('cuda')
+    except Exception:
+        return False
+    _MD5_GPU_T, _MD5_GPU_DEV = T, dev
+    return True
+
+
+def _md5_gpu_compress(M, h0, h1, h2, h3):
+    """MD5 压缩函数（torch.int32），M 为 (n,16) 小端 32bit 字；返回 4 个 (n,) int32。
+
+    与 hashlib 逐字节对拍（selftest 含 0/55/56/63/64/119B 边界与随机消息）。
+    """
+    T = _MD5_GPU_T
+    A, B, Cc, D = h0, h1, h2, h3
+    K = _MD5_K
+    S = _MD5_S
+    for i in range(64):
+        if i < 16:
+            F = (B & Cc) | (~B & D)
+            g = i
+        elif i < 32:
+            F = (D & B) | (~D & Cc)
+            g = (5 * i + 1) % 16
+        elif i < 48:
+            F = B ^ Cc ^ D
+            g = (3 * i + 5) % 16
+        else:
+            F = Cc ^ (B | (~D))
+            g = (7 * i) % 16
+        F = F + A + _i32(K[i]) + M[:, g]
+        s = S[i]
+        F = (F << s) | ((F >> (32 - s)) & ((1 << s) - 1))
+        A, D, Cc, B = D, Cc, B, B + F
+    return h0 + A, h1 + B, h2 + Cc, h3 + D
+
+
+def _md5_gpu_iv(T, n):
+    dev = _MD5_GPU_DEV
+    return tuple(T.full((n,), _i32(v), dtype=T.int32, device=dev) for v in _MD5_IV)
+
+
+def _md5_gpu_1block(words):
+    T = _MD5_GPU_T
+    h = _md5_gpu_iv(T, words.shape[0])
+    return _md5_gpu_compress(words, *h)
+
+
+def _md5_gpu_2block(w0, w1):
+    T = _MD5_GPU_T
+    h = _md5_gpu_iv(T, w0.shape[0])
+    h = _md5_gpu_compress(w0, *h)
+    return _md5_gpu_compress(w1, *h)
+
+
+def _md5_gpu_plan(charset, max_len, limit):
+    """判断是否走 GPU：返回 (chars, cbytes) 或 None（None = 用 CPU hashlib 路径）。"""
+    if not _md5_gpu_backend():
+        return None
+    if not isinstance(charset, str) or not charset or max_len < 0:
+        return None
+    if max_len > _MD5_GPU_MAX_BYTES:
+        return None
+    chars = list(charset)
+    try:
+        cbytes = [c.encode('utf-8') for c in chars]
+    except UnicodeEncodeError:          # 孤立代理项等异常字符交给 CPU 路径（与原行为一致）
+        return None
+    maxcb = max(len(b) for b in cbytes)
+    if max_len * maxcb > _MD5_GPU_MAX_BYTES:
+        return None                     # 超过 2 个 64B 块：CPU 路径（否则需通用多块内核）
+    C = len(chars)
+    space, pw = 0, 1
+    for _ in range(max_len + 1):
+        space += pw
+        pw *= C
+        if space > (1 << 62):           # 候选序号需放进 int64
+            return None
+    work = space if not limit else min(space, limit)
+    if work < _MD5_GPU_MIN_WORK:        # 小空间 GPU 启动开销不划算：CPU 更快
+        return None
+    return chars, cbytes
+
+
+def _md5_gpu_pad_1(buf, msg_len):
+    """buf (n,64) uint8 已填 msg_len 字节；补 0x80 + 64bit 小端位长。"""
+    buf[:, msg_len] = 0x80
+    bits = msg_len * 8
+    for k in range(8):
+        buf[:, 56 + k] = (bits >> (8 * k)) & 0xFF
+
+
+def _md5_gpu_chunk_general(tbl, digs, lens, msg_len, offs, n, L):
+    """混合字符宽度的补齐（通用路径，跨 1~2 块）：返回 4 个 (n,) int32 摘要字。"""
+    T = _MD5_GPU_T
+    dev = _MD5_GPU_DEV
+    nb = 1 if L * tbl['maxcb'] <= 55 else 2
+    W = 64 if nb == 1 else 128
+    vbuf = T.zeros((n, W), dtype=T.uint8, device=dev)
+    rows = T.arange(n, device=dev)
+    row_base = (rows * W).unsqueeze(1)
+    for j in range(tbl['maxcb']):
+        vals = tbl['cbj'][j][digs]
+        pos = (row_base + offs + j)
+        valid = j < lens
+        idx = pos[valid]
+        if idx.numel():
+            vbuf.view(-1)[idx] = vals[valid]
+    vbuf[rows, msg_len] = 0x80
+    bits = msg_len * 8
+    one = msg_len <= 55
+    if nb == 1:
+        for k in range(8):
+            vbuf[:, 56 + k] = ((bits >> (8 * k)) & 0xFF).to(T.uint8)
+        return _md5_gpu_1block(vbuf.view(T.int32))
+    two = ~one
+    for k in range(8):
+        byte = ((bits >> (8 * k)) & 0xFF).to(T.uint8)
+        if bool(one.any()):
+            vbuf[rows[one], 56 + k] = byte[one]
+        if bool(two.any()):
+            vbuf[rows[two], 120 + k] = byte[two]
+    h_first = _md5_gpu_compress(vbuf[:, :64].contiguous().view(T.int32),
+                                *_md5_gpu_iv(T, n))
+    h_final = _md5_gpu_compress(vbuf[:, 64:].contiguous().view(T.int32), *h_first)
+    return tuple(T.where(one, h_first[t], h_final[t]) for t in range(4))
+
+
+# GPU 路径按 charset 缓存的查表（进程内复用，避免每个 chunk 重建）
+_md5_gpu_tables = {}
+
+
+def _md5_gpu_tables_for(chars, cbytes):
+    if _MD5_GPU_T is None and not _md5_gpu_backend():
+        raise RuntimeError('GPU 后端不可用（需要 torch + CUDA）')
+    key = tuple(chars)
+    if key in _md5_gpu_tables:
+        return _md5_gpu_tables[key]
+    T = _MD5_GPU_T
+    dev = _MD5_GPU_DEV
+    lens = T.tensor([len(b) for b in cbytes], dtype=T.int64, device=dev)
+    maxcb = max(len(b) for b in cbytes)
+    cbj = [T.tensor([cb[j] if j < len(cb) else 0 for cb in cbytes],
+                    dtype=T.uint8, device=dev) for j in range(maxcb)]
+    flat = T.tensor([b for cb in cbytes for b in cb], dtype=T.uint8, device=dev)
+    tbl = {'lens': lens, 'cbj': cbj, 'flat': flat, 'maxcb': maxcb,
+           'uniform': maxcb if all(len(b) == maxcb for b in cbytes) else 0}
+    _md5_gpu_tables.clear()          # 只缓存最近一种 charset，避免显存积累
+    _md5_gpu_tables[key] = tbl
+    return tbl
+
+
+def _md5_gpu_crack(tgt, chars, cbytes, max_len, limit):
+    """GPU 批处理爆破：与 itertools.product 枚举顺序一致，返回第一个命中。
+
+    返回 (命中明文 bytes 或 None, 已尝试数, 耗时秒)，语义与 _md5_crack_cpu 完全相同。
+    """
+    if _MD5_GPU_T is None or _MD5_GPU_DEV is None:
+        if not _md5_gpu_backend():
+            raise RuntimeError('GPU 后端不可用（需要 torch + CUDA）')
+    T = _MD5_GPU_T
+    dev = _MD5_GPU_DEV
+    t0 = time.time()
+    C = len(chars)
+    tbl = _md5_gpu_tables_for(chars, cbytes)
+    uniform, maxcb = tbl['uniform'], tbl['maxcb']
+    tgt_words = [T.tensor([_i32(int.from_bytes(tgt[i * 4:i * 4 + 4], 'little'))],
+                          dtype=T.int32, device=dev) for i in range(4)]
+    space, pw = 0, 1
+    for _ in range(max_len + 1):
+        space += pw
+        pw *= C
+    total = space if not limit else min(space, limit)
+    processed = 0
+    prefix = 0                       # 长度 L 之前的候选数（枚举序号基准）
+    for L in range(max_len + 1):
+        if processed >= total:
+            break
+        cnt = C ** L
+        limit_L = min(cnt, total - processed)
+        msg_len_u = L * uniform
+        if uniform:
+            nb = 1 if msg_len_u <= 55 else 2
+            chunk = _MD5_GPU_CHUNK_1 if nb == 1 else _MD5_GPU_CHUNK_2
+        else:
+            chunk = _MD5_GPU_CHUNK_1 if L * maxcb <= 55 else _MD5_GPU_CHUNK_2
+        off = 0
+        while off < limit_L:
+            n = min(chunk, limit_L - off)
+            start = processed + off            # 全局枚举序号
+            local = start - prefix             # 本长度内的序号（product 基数展开用）
+            rem = T.arange(local, local + n, dtype=T.int64, device=dev)
+            digs = T.empty((n, L), dtype=T.int64, device=dev)
+            for pos in range(L - 1, -1, -1):   # 最后一位变化最快（与 itertools 一致）
+                digs[:, pos] = rem % C
+                rem = rem // C
+            if uniform:
+                if uniform == 1:
+                    bytes2d = tbl['flat'][digs]
+                else:
+                    base = digs.reshape(-1) * uniform
+                    idx = base.unsqueeze(1) + T.arange(uniform, dtype=T.int64, device=dev)
+                    bytes2d = tbl['flat'][idx.reshape(-1)].reshape(n, L * uniform)
+                if msg_len_u <= 55:
+                    buf = T.zeros((n, 64), dtype=T.uint8, device=dev)
+                    if msg_len_u:
+                        buf[:, :msg_len_u] = bytes2d
+                    _md5_gpu_pad_1(buf, msg_len_u)
+                    h = _md5_gpu_1block(buf.view(T.int32))
+                else:
+                    buf0 = T.zeros((n, 64), dtype=T.uint8, device=dev)
+                    buf1 = T.zeros((n, 64), dtype=T.uint8, device=dev)
+                    cut = min(64, msg_len_u)
+                    buf0[:, :cut] = bytes2d[:, :cut]
+                    if msg_len_u > 64:
+                        buf1[:, :msg_len_u - 64] = bytes2d[:, 64:]
+                    if msg_len_u < 64:
+                        buf0[:, msg_len_u] = 0x80
+                    else:
+                        buf1[:, msg_len_u - 64] = 0x80
+                    bits = msg_len_u * 8
+                    for k in range(8):
+                        buf1[:, 56 + k] = (bits >> (8 * k)) & 0xFF
+                    h = _md5_gpu_2block(buf0.view(T.int32), buf1.view(T.int32))
+            else:
+                lens = tbl['lens'][digs]
+                msg_len = lens.sum(1)
+                offs = lens.cumsum(1) - lens
+                h = _md5_gpu_chunk_general(tbl, digs, lens, msg_len, offs, n, L)
+            match = ((h[0] == tgt_words[0]) & (h[1] == tgt_words[1]) &
+                     (h[2] == tgt_words[2]) & (h[3] == tgt_words[3]))
+            hit_idx = int(match.nonzero()[0]) if bool(match.any()) else -1
+            if hit_idx >= 0:
+                g = local + hit_idx
+                ds = [0] * L
+                for pos in range(L - 1, -1, -1):
+                    ds[pos] = g % C
+                    g //= C
+                hit = b''.join(cbytes[d] for d in ds)
+                return hit, processed + off + hit_idx + 1, time.time() - t0
+            off += n
+        processed += limit_L
+        prefix += cnt
+    return None, processed, time.time() - t0
+
+
+# ---------------------------------------------------------------- CPU / 分发
+def _md5_crack_cpu(target_hex, charset, max_len, limit=None):
+    """原有 hashlib CPU 路径（无 GPU / 小空间时使用，行为与原实现完全一致）。"""
+    tgt = target_hex if isinstance(target_hex, (bytes, bytearray)) else bytes.fromhex(target_hex)
     tried = 0
     t0 = time.time()
     for L in range(0, max_len + 1):        # L=0：空口令也是合法候选
@@ -392,6 +683,23 @@ def md5_crack(target_hex, charset, max_len, limit=None):
             if limit and tried >= limit:
                 return None, tried, time.time() - t0
     return None, tried, time.time() - t0
+
+
+def md5_crack(target_hex, charset, max_len, limit=None):
+    """暴力 MD5（长度 0 ≤ L ≤ max_len）。返回 (命中明文或 None, 已试次数, 耗时秒)。
+
+    路径自动选择：torch-cuda 且有效候选数 ≥ _MD5_GPU_MIN_WORK 时走 GPU 批处理
+    （枚举顺序/首个命中/limit 语义与 CPU 路径逐项一致）；否则用 hashlib CPU 路径。
+    """
+    tgt = bytes.fromhex(target_hex)
+    plan = _md5_gpu_plan(charset, max_len, limit)
+    if plan is not None:
+        chars, cbytes = plan
+        try:
+            return _md5_gpu_crack(tgt, chars, cbytes, max_len, limit)
+        except Exception as ex:        # 显存/驱动等运行期问题：回退 CPU，结果不受影响
+            C.info(f'[md5] GPU 路径不可用（{type(ex).__name__}: {ex}），回退 CPU hashlib 路径')
+    return _md5_crack_cpu(tgt, charset, max_len, limit)
 
 
 # =====================================================================
@@ -796,6 +1104,82 @@ def cmd_selftest(a):
     ok = hit == b"abc"
     print(f'[MD5 爆破] {"PASS" if ok else "FAIL"}  {tried} 次 / {dt:.3f}s')
     fails += not ok
+
+    # MD5 GPU 批处理：内核与 CPU hashlib 路径逐项对拍（含 RFC1321 向量、多字节/混合 charset、
+    # 0/55/56/63/64/119B 边界、重复字符首命中顺序、limit 语义）。
+    # 无 CUDA 时 SKIP（不计数失败）；有 CUDA 时增量约 0.6~1s（首次 torch CUDA 内核/惰性导入）。
+    has_cuda = _md5_gpu_backend()
+    if not has_cuda:
+        print('[MD5 GPU 对拍] SKIP  （无 CUDA，走 CPU hashlib 路径）')
+    else:
+        ok = True
+        T = _MD5_GPU_T
+
+        def _gpu_digests(msgs):
+            """一批消息 -> GPU 摘要列表（按 1/2 块分批，单次内核调用/批，selftest 更快）。"""
+            out = [None] * len(msgs)
+            for nb in (1, 2):
+                idxs = [i for i, m in enumerate(msgs)
+                        if (len(m) <= 55) == (nb == 1)]
+                if not idxs:
+                    continue
+                W = nb * 64
+                buf = T.zeros((len(idxs), W), dtype=T.uint8, device=_MD5_GPU_DEV)
+                for row, i in enumerate(idxs):
+                    m = msgs[i]
+                    if m:
+                        buf[row, :len(m)] = T.tensor(list(m), dtype=T.uint8, device=_MD5_GPU_DEV)
+                    buf[row, len(m)] = 0x80
+                    bits = len(m) * 8
+                    pos = 56 if nb == 1 else 120
+                    for k in range(8):
+                        buf[row, pos + k] = (bits >> (8 * k)) & 0xFF
+                if nb == 1:
+                    h = _md5_gpu_1block(buf.view(T.int32))
+                else:
+                    h = _md5_gpu_2block(buf[:, :64].contiguous().view(T.int32),
+                                        buf[:, 64:].contiguous().view(T.int32))
+                for row, i in enumerate(idxs):
+                    out[i] = b''.join(int(h[t][row]).to_bytes(4, 'little', signed=True)
+                                      for t in range(4))
+            return out
+
+        msgs = [b'', b'abc', b'ba', b'password', '中é'.encode(), 'é中'.encode(),
+                b'\x00' * 7, b'\xff' * 32, b'a' * 55,
+                b'a' * 56, b'b' * 63, b'c' * 64, b'd' * 119, bytes(range(56)),
+                '中'.encode() * 30]
+        gd = _gpu_digests(msgs)
+        for m, g in zip(msgs, gd):
+            if g != hashlib.md5(m).digest():
+                ok = False
+                print(f'  内核不一致 len={len(m)}: {g.hex()} vs {hashlib.md5(m).hexdigest()}')
+        # RFC1321 向量（显式）
+        if gd[0] != bytes.fromhex('d41d8cd98f00b204e9800998ecf8427e') or \
+                gd[1] != bytes.fromhex('900150983cd24fb0d6963f7d28e17f72'):
+            ok = False
+            print('  RFC1321 向量不一致')
+        # 爆破路径：枚举顺序/limit/多字节混合 charset/重复字符首命中
+        for charset, ml, limit, probe in (('abc', 3, None, b'abc'),
+                                          ('a中é', 2, None, '中é'.encode()),
+                                          ('abcdef', 3, 7, b'~~~~~~~~'),
+                                          ('aa', 2, None, b'a')):
+            tgt = hashlib.md5(probe).digest()
+            if probe == b'~~~~~~~~':
+                pass                     # 未命中用例：目标就是任意不存在值
+            cbytes = [x.encode('utf-8') for x in charset]
+            g = _md5_gpu_crack(tgt, list(charset), cbytes, ml, limit)
+            c = _md5_crack_cpu(tgt, charset, ml, limit)
+            if (g[0], g[1]) != (c[0], c[1]) or (probe != b'~~~~~~~~' and g[0] != probe):
+                ok = False
+                print(f'  爆破不一致 charset={charset!r} limit={limit}: gpu={g[:2]} cpu={c[:2]}')
+        # 自动选择条件：小空间/小 limit/超长消息回退 CPU；大空间走 GPU
+        plan_ok = (_md5_gpu_plan('abc', 3, None) is None
+                   and _md5_gpu_plan('abcdefghij', 7, None) is not None
+                   and _md5_gpu_plan('abcdefghij', 12, 1000) is None
+                   and _md5_gpu_plan('a', 200, None) is None)
+        print(f'[MD5 GPU 对拍] {"PASS" if ok and plan_ok else "FAIL"}  '
+              f'内核 {len(msgs)} 例 + 爆破 4 例 / 阈值回退 {"PASS" if plan_ok else "FAIL"}')
+        fails += not (ok and plan_ok)
 
     # RSA：构造小密钥自测
     p, q = 1000003, 1000033

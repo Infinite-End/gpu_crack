@@ -2,9 +2,9 @@
 
 | 文档属性 | 值 |
 |---|---|
-| 文档版本 | v3.4（2026-11-09） |
+| 文档版本 | v3.5（2026-11-10） |
 | 适用工具 | gpu_crack toolkit v2（仓库根目录） |
-| 校验状态 | 与 `--help` 和各模块自测一致；`python -X utf8 verify_all.py` 六层全绿（doc_lint 50 / 模块 13+31+23 / 主框架 42 / consistency 45 / fuzz 17 类 / dispatcher+示例） |
+| 校验状态 | 与 `--help` 和各模块自测一致；`python -X utf8 verify_all.py` 六层全绿（doc_lint 50 / 模块 18+32+23 / 主框架 54 / consistency 45 / fuzz 17 类 / dispatcher+示例） |
 | 配套文档 | [README.md](README.md)（项目说明）、skill 的 `SKILL.md` / `references/kernels.md`（使用策略） |
 
 本手册是**规范性**参考：所有参数名、默认值、输入格式、输出标记、退出码均以本手册为准。
@@ -28,7 +28,7 @@
 | 参数 | 取值 | 默认 | 模块 | 说明 |
 |---|---|---|---|---|
 | `--backend` | `auto` / `torch` / `numpy` | `auto` | gpu_crack, ctf_tools, ctf_ext | `auto` = torch-cuda → torch-cpu → numpy 依次回退 |
-| `--chunk` | 正整数 | gpu_crack `65536`；ctf_tools `16384` | gpu_crack, ctf_tools | 每批候选数；显存不足时**自动**减半重试 |
+| `--chunk` | 正整数 | **自动档**（不传时自适应；详见下） | gpu_crack, ctf_tools | 每批候选数 / 断点粒度；显存不足时**自动**减半重试 |
 | `--json` | 开关 | 关 | gpu_crack, ctf_tools, ctf_ext | 结果行改为单行 JSON（`{"event":...}`），便于程序/agent 解析 |
 | `--quiet` | 开关 | 关 | gpu_crack, ctf_tools, ctf_ext | 抑制横幅与进度，只留结果行 |
 | `--no-progress` | 开关 | 关 | gpu_crack, ctf_tools, ctf_ext | 不打印进度/ETA（结果仍输出） |
@@ -42,6 +42,15 @@
 > - `ctf_ext.py` 不支持 `--chunk`，误传时会提示「已忽略」并继续执行，不报错。
 >
 > 通过统一入口 `ctf.py` 调用时位置随意：`python ctf.py mtscan ... --backend numpy` 亦可。
+>
+> **`--chunk` 自动档（v3.5）**：不传 `--chunk` 时按后端/内存自适应——`gpu_crack mtscan` 在原生 CUDA 下
+> 单块最大 2^26 种子、torch-cuda 下 twist=0 取 2^18 / twist=1 取 2^16、CPU 用 2^16；
+> `ctf_tools chacha --brute` 在 GPU 上默认 262144、CPU 上 16384。显式传 `--chunk N` 完全尊重。
+>
+> **原生 CUDA 加速（v3.5）**：`mtscan` / `lfsrscan` 在 `torch-cuda` 后端且 torch 安装目录自带 NVRTC 时，
+> 自动使用运行期 JIT 融合内核（每块 1 次 launch；**不需要 nvcc/triton**）。失败静默回退 torch/numpy
+> （预检/运行期失败打印 `[warn]`，输出与回退路径逐字节一致）；`GPU_CRACK_NO_NATIVE=1` / `CTF_NO_NATIVE=1`
+> 静默禁用。`--backend numpy` 强制纯 numpy 路径。
 
 > **断点文件格式（v2）**：JSON `{"version": 2, "next": int, "hits": [...], "meta": {...}}`，每完成一批落盘一次。
 > `meta` 记录任务指纹（`label` / `start` / `total` + 调用方补充项如目标 key/target）。续跑时若 meta 与本次参数
@@ -121,10 +130,10 @@ python ctf.py bench
 
 | 项 | 说明 |
 |---|---|
-| 输入 | 无；可选 `--markdown` 输出 Markdown 表格（写入 `docs/bench.md` 用）、`--json` 输出每内核一条 JSON 事件 |
+| 输入 | 无；可选 `--markdown` 输出 Markdown 表格（写入 `docs/bench.md` 用）、`--json` 输出每内核一条 JSON 事件、`--profile` 逐内核输出 GPU 时间/launch 次数/占 wall 比例（stdout 追加 `[profile]` 行；`--json` 时追加 `event=profile` 对象） |
 | 输出 | 普通模式（stdout）：`[backend] ...`、`[device ] ...`（torch 时）、`[popcount] ... M 个/s`、`[mt19937 ] ... K keys/s`、`[aes128/192/256] ... K blocks/s`；`--markdown`/`--json`/`--quiet` 时横幅被抑制：`--markdown` stdout **只有** Markdown 表格，`--json` stdout 只有 `{"event":"bench","kernel":"popcount|mt19937|aes128|aes192|aes256","rate":<float>,"unit":"M 个/s|K keys/s|K blocks/s","count":"…","seconds":<float>}` 行 |
 | 退出码 | 0 |
-| 备注 | 已内置 3 次预热以排除 JIT 编译；支持 `--backend auto|torch|numpy`（torch-cpu 后端也可跑，不再要求 CUDA）；正式搜索前先跑 |
+| 备注 | 已内置预热并改为 **min-of-5** 计时（排除 JIT/调度毛刺）；支持 `--backend auto|torch|numpy`（torch-cpu 后端也可跑，不再要求 CUDA）；原生 CUDA 可用时 `--profile` 会额外列出 native_mt_t0/t1、native_lfsr 行；正式搜索前先跑 |
 
 ### 1.2 `mtscan` — mt19937 种子暴力匹配
 
@@ -149,7 +158,11 @@ python ctf.py mtscan --key-hex <1~24B hex> [--seed-start 0] [--seed-count 167772
 
 - 退出码：`0` 成功（未命中也是 0，靠输出判断）；`2` 参数/输入错误。
 - 示例：`python ctf.py mtscan --key-hex ac2f75c043fbc36709d315f2 --seed-start 0 --seed-count 100000000`
-- 备注：命中后会再算一次完整 key 并检查与目标一致才输出（复核）；目标 key 长度 L 只生成前 L 字节（L 越短越快）。短扫描（<10M）吞吐会被 ~0.32 s CUDA 初始化摊薄，测吞吐建议 ≥10M 或看 `bench`。
+- 备注：命中后会再算一次完整 key 并检查与目标一致才输出（复核）；目标 key 长度 L 只生成前 L 字节（L 越短越快）。
+- **原生 CUDA（v3.5）**：torch-cuda 且 NVRTC 可用时，整块种子扫描（生成+mt19937+比较+命中回传）由
+  单次融合 kernel 完成，计算段可达 16.3 G seeds/s（twist=0）/1.5 G seeds/s（twist=1）；`--chunk` 不传时
+  自动档（原生最大 2^26）。不可用时回退 torch/numpy，结果逐字节一致；`GPU_CRACK_NO_NATIVE=1` 可关闭。
+- 端到端 CLI 含 ~2.3 s 启动（Python+torch import），短扫描读数会被它摊薄；测吞吐建议长扫描或看 `bench`。
 
 ### 1.3 `sboxscan` — AES-128/192/256 S-box 故障枚举
 
@@ -214,6 +227,10 @@ python ctf.py lfsrscan --taps "25:10,11,24[;28:12,22,25 ...]" --bits <0/1 串> [
 
 - 退出码：`0`；`2`（bits 非 0/1、tap 越界、trials≤0、格式错误）。
 - 备注：LFSR 约定为右移 Fibonacci：`fb = xor(选中位)`，输出 `fb`，状态右移并补 `fb` 到最高位。
+- **原生 CUDA（v3.5）**：所有组 n≤63 时走 u64 位打包融合内核（整组 1 次 launch，65536×512 拍 kernel
+  0.27 ms）；n>63 或不可用时回退位打包/矩阵路径，最佳位数一致；`GPU_CRACK_NO_NATIVE=1` 可关闭。
+- **复现性变化（v3.5）**：初始状态抽样改为单次整数抽样以配合位打包；同 `--rng-seed` 在**同一版本**内
+  完全可复现且 native/torch/numpy 一致，但数值与 v3.4 不同（跨版本比较请比对算法正确性而非 best 数字）。
 
 ---
 
@@ -231,7 +248,7 @@ python ctf_tools.py [--backend {torch,numpy}] selftest
 
 - 说明：`selftest` 是模块级子命令，必须直接运行模块脚本；统一入口的 `ctf.py selftest`
   会跑「四个模块」的组合自测（见第 7 节）。
-- 输出：13 条 `[名称] PASS` + `[性能]` 三行；`--json` 时每条断言一行 JSON 事件（`{"event":"selftest","name",...,"ok":true}`）。
+- 输出：18 条 `[名称] PASS` + `[性能]` 三行；`--json` 时每条断言一行 JSON 事件（`{"event":"selftest","name",...,"ok":true}`）。
 - 退出码：全部 PASS → `0`；有 FAIL → `1`。
 - 覆盖：ChaCha20 RFC8439 / 原版变体、Poly1305 RFC8439、ChaCha20-Poly1305 AEAD、
   RS(63,31) 合法/非法码字、CRC32 向量、AES-192 CTR、xorbrute 经典向量、keys-file BOM 容错、
@@ -250,7 +267,7 @@ python ctf.py chacha --target-hex <ks hex> (--keys-file <path> | --brute)
 | `--nonce-hex` | ❌ | `000000000000004a00000000`（12B） | 12B → RFC7539；8B → 原版（64bit 计数器） |
 | `--counter` | ❌ | `0` | 起始计数器（RFC7539 为 32bit，溢出拒绝） |
 | `--keys-file` | 二选一 | — | 每行一个 32B hex 密钥；容忍 `0x` 前缀、`#` 注释、空行、UTF-8 BOM |
-| `--brute` | 二选一 | — | 随机密钥搜索演示（配 `--tries`/`--chunk`；支持 `--checkpoint` 断点续跑） |
+| `--brute` | 二选一 | — | 随机密钥搜索演示（配 `--tries`/`--chunk`；支持 `--checkpoint` 断点续跑）。**GPU 路径（v3.5）**：torch-cuda 时 keys 在 GPU 生成、keystream 与比较全留 GPU，`--chunk` 默认 262144；随机流来自 torch generator（仍不可复现） |
 | `--key-len` | ❌ | `32` | 仅支持 32（保留参数，其它值报错） |
 | `--tries` | ❌ | `1048576`(2^20) | `--brute` 模式下最多尝试密钥数 |
 
@@ -263,7 +280,7 @@ python ctf.py chacha --target-hex <ks hex> (--keys-file <path> | --brute)
 
 - 退出码：`0`（未命中也是 0）；`2` 输入错误。
 - 示例：`python ctf.py chacha --target-hex 10f1e7e4d13b5915500fdd1fa32071c4 --nonce-hex 000000090000004a00000000 --counter 1 --keys-file keys.txt`
-- 备注：`keys-file` 每行必须正好 32 字节密钥（行内可带 `0x`）；`--brute` 走统一分块调度，
+- 备注：`keys-file` 每行必须正好 32 字节密钥（行内可带 `0x`）；批量核自在 GPU 上用 uint32 状态 + 多块并行（v3.5 吞吐 10.9–18.3 M keys/s，旧 1.8 M/s）；`--brute` 走统一分块调度，
   `--chunk`/`--checkpoint`/`--reset-checkpoint` 生效，断点带任务指纹（换 nonce/counter/目标会从头重扫）。
 
 ### 2.3 `poly1305` — Poly1305 / AEAD tag
@@ -352,6 +369,10 @@ python ctf.py xorbrute --data-hex <hex> [--max-len 3] [--top 10]
 - 退出码：`0`；`2` 输入错误。
 - 备注：打分=词频权重 + flag 结构（已知前缀重奖）；密文 <8 字节时统计不可靠。
   `--chunk`/`--checkpoint` 生效（断点带任务指纹：换目标/长度会自动从头重扫），结果与 `--chunk` 取值无关。
+- **GPU 路径（v3.5）**：torch-cuda 时候选键生成 / `data^key` / 整数打分 / 结构加分 / top-k 全部在 GPU，
+  3 字节/16B 扫描段从 6.5~7.9 s 降到 **0.28~0.30 s**（~22–24×）；与 CPU(numpy) 路径 top 结果逐项一致。
+  并列分次序显式化为「分数降序、批内候选序号降序」，CPU/GPU/任意 `--chunk` 一致（跨版本同分候选次序可能变化）；
+  小空间（≤2 字节）GPU kernel 启动开销 > 收益，仍走 CPU 路径。
 
 ### 2.7 `aesctr` — AES-128/192/256-CTR
 
@@ -416,7 +437,7 @@ stdout 每行一个 JSON 对象；进度/横幅只走 stderr。字段以 `event`
 python ctf_ext.py [--backend numpy] selftest
 ```
 
-- 输出：36 项断言（TEA/XTEA/XXTEA/Speck32-64/Speck64-128/Speck128 系列/RC4/LCG/MD5/RSA（含共模、广播、p-1、明文 0）/自动解码/ECC/zipbrute/CLI 参数校验）的 PASS 行，约 2.6 s。
+- 输出：32 项断言（TEA/XTEA/XXTEA/Speck32-64/Speck64-128/Speck128 系列/RC4/LCG/MD5（含 GPU 对拍）/RSA（含共模、广播、p-1、明文 0）/自动解码/ECC/zipbrute/CLI 参数校验）的 PASS 行，约 3.9 s（无 CUDA 时 GPU 对拍打印 SKIP）。
 - 退出码：`0`=全 PASS；`N`=失败项数（1..N）。注意：`2` 既可能表示 2 项失败，也可能是用法错误，需看输出。
 
 ### 3.2 `tea` — TEA / XTEA / XXTEA
@@ -502,6 +523,10 @@ python ctf.py md5 --target <32 hex> [--charset abc...] [--max-len 4]
 - 输出：`[md5] 尝试 {n:,} 次 / {t:.2f}s  命中: b'...'`（或 `未命中`）
 - 退出码：`0`（未命中也是 0）；`2` 参数错误。
 - 备注：`--max-len`/`--charset` 组合爆炸，注意规模（如 62^4≈1.5e7）。
+- **GPU 批量路径（v3.5）**：torch-cuda 且有效候选数 `min(空间, limit) ≥ 2,000,000` 时自动走 GPU
+  （候选混合进制展开、padding、64 轮压缩全在 GPU；吞吐 21–39 M 候选/s，CPU hashlib 2.4–2.55 M/s）；
+  枚举顺序/首个命中/`tried`/输出/退出码与 CPU 路径逐项一致。消息长度需 ≤119 B（1~2 个 64B 块），
+  超限或运行期异常自动回退 hashlib CPU 路径（stderr 提示）；`--backend numpy` 强制 CPU。
 
 ### 3.7 `rsa` — 多攻击自动尝试
 
@@ -827,6 +852,7 @@ python ctf.py -- <module> [参数...]    # 强制结束全局参数解析，避�
 | `python -X utf8 ctf_common.py` | 公共调度层自检（分块边界/OOM 降档/断点 meta 隔离/输出契约），结尾 `CTF-COMMON: ALL PASS` | 0 / 1 |
 | `python -X utf8 ctf_registry.py` | 注册表自检（版本/视图一致/SCRIPT_GLOBALS/插件静态读取/坏插件容错），结尾 `REGISTRY: ALL PASS` | 0 / 1 |
 | `python -X utf8 examples/make_examples.py --check` | 生成示例（含 ZipCrypto 的 `locked.zip`，口令 hunter2）、校验幂等哈希，再逐条复跑 examples/README.md 的 6 条命令，打印 `6/6 PASS` | 0 全部可跑 / 1 有失败 |
+| `python -X utf8 gpu_profile.py` | GPU 利用率测量：CLI 模式（nvidia-smi 采样 → wall/busy%/显存/功率，`--subtract-startup` 扣启动地板）+ `--inproc`（torch.profiler 统计 kernel 时间/launch/GPU 占比）+ `--save/--compare/--only/--quick/--json`；`--selfcheck` 23/23 PASS、无需 GPU | 0 / 1 / 2 |
 
 说明：`verify_all.py`、`fuzz_kernels.py` 是 v3.2 新增的验证入口；`doc_lint.py` 会检查这两者是否被文档引用，
 以及文档版本是否等于单一真源 `ctf_registry.VERSION`。

@@ -13,12 +13,12 @@ ctf_tools.py — CTF 常用密码学内核（与 gpu_crack.py 共用后端）
   crc32     CRC32 批量计算 / 尾部 1~2 字节爆破匹配
   xorbrute  1~3 字节重复 XOR 爆破，按词频 + flag 结构打分
   aesctr    AES-192 CTR 密钥流 / 加解密
-  selftest  已知向量自测（13 项；全 PASS 退出码 0，失败 1）
+  selftest  已知向量自测（18 项；全 PASS 退出码 0，失败 1）
 
 全局参数（必须写在子命令之前）
 ------------------------------
   --backend {auto,torch,numpy}   默认 auto
-  --chunk N                      每批候选数 / 断点粒度，默认 16384（chacha --brute、xorbrute 用）
+  --chunk N                      每批候选数 / 断点粒度（chacha --brute：GPU 默认 262144，其它 16384）
   --checkpoint FILE              断点文件（chacha --brute、xorbrute 支持续跑）
   --reset-checkpoint             忽略已有断点
   --json                         结果行改为单行 JSON 事件（stdout 只有事件）
@@ -137,24 +137,21 @@ def _json_locate(kind, **fields):
 # =====================================================================
 # 1. ChaCha20
 # =====================================================================
+def _is_gpu():
+    """当前后端是否为 torch-CUDA（GPU 快速路径开关）。"""
+    return _is_torch() and G.BACKEND == 'torch-cuda'
+
+
+_CHACHA_CONST = (0x61707865, 0x3320646E, 0x79622D32, 0x6B206574)
+
+
 def _rotl(x, n):
-    # 注意：numpy 后端必须用 Python int 掩码。NumPy 2 起 int64 数组与 np.uint64
-    # 标量做位运算会被提升为 float64，直接 TypeError（旧代码只测过 torch 后端）。
+    # 兼容旧内部名（numpy 标量路径已不再使用；保留给外部脚本引用）
     return ((x << n) | (x >> (32 - n))) & M32
 
 
-def chacha20_keystream(keys, nonce, counter=0, nbytes=64, rfc7539=None):
-    """
-    批量生成 ChaCha20 密钥流。
-    keys   : [B,32] uint8 张量/ndarray（或 32 字节 bytes，单密钥）
-    nonce  : 12 字节（rfc7539）/ 8 字节（原版）
-    counter: 起始计数器（rfc7539 为 32 位；原版为 64 位）
-    rfc7539: None = 按 nonce 长度自动判断（12B→True，8B→False）
-    nbytes : 要生成的字节数（允许 0）
-    返回   : [B, nbytes] uint8 (numpy)
-    """
-    T = _T()
-    is_t = _is_torch()
+def _chacha_parse(nonce, counter, nbytes, rfc7539):
+    """公共参数校验（两个后端共用），返回 (nonce, counter, nbytes, rfc7539, blocks)。"""
     nonce = bytes(nonce)
     if rfc7539 is None:
         rfc7539 = (len(nonce) == 12)
@@ -170,91 +167,207 @@ def chacha20_keystream(keys, nonce, counter=0, nbytes=64, rfc7539=None):
     if counter < 0 or counter > max_ctr or counter + max(0, blocks - 1) > max_ctr:
         raise ValueError(f'ChaCha20 计数器越界（counter={counter}, blocks={blocks}, '
                          f'rfc7539={rfc7539}, 上限 {max_ctr}）')
+    return nonce, counter, nbytes, bool(rfc7539), blocks
+
+
+def _chacha_words32(byte_mat):
+    """[B,4k] uint8 → [B,k] uint32（每 4 字节小端合成 1 个字）。"""
+    b = byte_mat.astype(np.uint32).reshape(byte_mat.shape[0], -1, 4)
+    return b[:, :, 0] | (b[:, :, 1] << np.uint32(8)) | (b[:, :, 2] << np.uint32(16)) \
+        | (b[:, :, 3] << np.uint32(24))
+
+
+def _rotl32_np(x, n):
+    """uint32 ndarray 循环左移（逻辑移位；uint32 运算天然回绕）。"""
+    return (x << np.uint32(n)) | (x >> np.uint32(32 - n))
+
+
+def _rotl32_t(x, n):
+    """torch int32 循环左移：算术右移后用掩码消掉符号扩展位。
+
+    注意掩码是 (1<<n)-1（右移 32-n 位后只保留低 n 位），不是 (1<<(32-n))-1。
+    """
+    return (x << n) | ((x >> (32 - n)) & ((1 << n) - 1))
+
+
+def _chacha20_ks_numpy(keys, nonce, counter, nbytes, rfc7539):
+    """numpy 后端：uint32 状态 + 每行一个连续一维数组 + 所有块一次性并行。"""
+    B = keys.shape[0]
+    blocks = (nbytes + 63) // 64
+    if blocks == 0:
+        return np.zeros((B, 0), dtype=np.uint8)
+    N = B * blocks
+    kw = _chacha_words32(keys)                     # [B,8] uint32
+    blk_idx = np.tile(np.arange(blocks, dtype=np.uint64), B)
+    nw = _chacha_words32(np.frombuffer(
+        bytes(nonce), dtype=np.uint8).reshape(1, len(nonce)))
+    st = [np.full(N, np.uint32(v), dtype=np.uint32) for v in _CHACHA_CONST]
+    for i in range(8):
+        st.append(np.repeat(kw[:, i], blocks).astype(np.uint32))
+    if rfc7539:
+        st.append(((np.uint64(counter) + blk_idx) & np.uint64(M32)).astype(np.uint32))
+        for i in range(3):
+            st.append(np.full(N, np.uint32(nw[0, i]), dtype=np.uint32))
+    else:
+        low = (np.uint64(counter) & np.uint64(M32)) + blk_idx
+        st.append((low & np.uint64(M32)).astype(np.uint32))
+        hi = ((np.uint64(counter) >> np.uint64(32)) + (low >> np.uint64(32))) & np.uint64(M32)
+        st.append(hi.astype(np.uint32))
+        for i in range(2):
+            st.append(np.full(N, np.uint32(nw[0, i]), dtype=np.uint32))
+
+    x = [a.copy() for a in st]
+
+    def qr(a, b, c, d):
+        xa, xb, xc, xd = x[a], x[b], x[c], x[d]
+        xa += xb
+        xd ^= xa; xd = _rotl32_np(xd, 16)
+        xc += xd
+        xb ^= xc; xb = _rotl32_np(xb, 12)
+        xa += xb
+        xd ^= xa; xd = _rotl32_np(xd, 8)
+        xc += xd
+        xb ^= xc; xb = _rotl32_np(xb, 7)
+        x[a], x[b], x[c], x[d] = xa, xb, xc, xd
+
+    for _ in range(10):
+        qr(0, 4, 8, 12); qr(1, 5, 9, 13); qr(2, 6, 10, 14); qr(3, 7, 11, 15)
+        qr(0, 5, 10, 15); qr(1, 6, 11, 12); qr(2, 7, 8, 13); qr(3, 4, 9, 14)
+    words = np.stack([x[i] + st[i] for i in range(16)], axis=1)   # [N,16] uint32
+    raw = words.view(np.uint8).reshape(N, 64)                      # 小端字节序
+    return raw.reshape(B, blocks * 64)[:, :nbytes]
+
+
+def _chacha20_ks_torch(keys_t, nonce, counter, nbytes, rfc7539):
+    """torch 后端：int32 状态 + 连续一维字数组 + 所有块一次性并行。
+
+    返回同 device 的 uint8 张量（GPU 路径不落 CPU）：`chacha --brute` 直接拿它
+    在 GPU 上与目标比较，避免 keystream 回传再比较的往返。
+    """
+    T = G.torch
+    dev = keys_t.device
+    B = int(keys_t.shape[0])
+    blocks = (nbytes + 63) // 64
+    if blocks == 0:
+        return T.zeros((B, 0), dtype=T.uint8, device=dev)
+    N = B * blocks
+    kw = keys_t.reshape(B, 8, 4).to(T.int32)        # [B,8,4]
+    kw = kw[..., 0] | (kw[..., 1] << 8) | (kw[..., 2] << 16) | (kw[..., 3] << 24)
+    blk_idx = T.arange(blocks, dtype=T.int64, device=dev).repeat(B)
+    nonce_b = bytes(nonce)
+    nw = [int.from_bytes(nonce_b[4 * i:4 * i + 4], 'little')
+          for i in range(len(nonce_b) // 4)]
+
+    def _i32(v):
+        v &= M32
+        return v - (1 << 32) if v >= (1 << 31) else v
+
+    st = [T.full((N,), _i32(v), dtype=T.int32, device=dev) for v in _CHACHA_CONST]
+    for i in range(8):
+        st.append(kw[:, i].repeat_interleave(blocks))
+    if rfc7539:
+        ctr = (int(counter) + blk_idx) & M32
+        st.append(ctr.to(T.int32))
+        for i in range(3):
+            st.append(T.full((N,), _i32(nw[i]), dtype=T.int32, device=dev))
+    else:
+        low = (int(counter) & M32) + blk_idx
+        st.append((low & M32).to(T.int32))
+        hi = ((int(counter) >> 32) + (low >> 32)) & M32
+        st.append(hi.to(T.int32))
+        for i in range(2):
+            st.append(T.full((N,), _i32(nw[i]), dtype=T.int32, device=dev))
+
+    x = [a.clone() for a in st]
+
+    def qr(a, b, c, d):
+        xa, xb, xc, xd = x[a], x[b], x[c], x[d]
+        xa = xa + xb
+        xd = _rotl32_t(xd ^ xa, 16)
+        xc = xc + xd
+        xb = _rotl32_t(xb ^ xc, 12)
+        xa = xa + xb
+        xd = _rotl32_t(xd ^ xa, 8)
+        xc = xc + xd
+        xb = _rotl32_t(xb ^ xc, 7)
+        x[a], x[b], x[c], x[d] = xa, xb, xc, xd
+
+    for _ in range(10):
+        qr(0, 4, 8, 12); qr(1, 5, 9, 13); qr(2, 6, 10, 14); qr(3, 7, 11, 15)
+        qr(0, 5, 10, 15); qr(1, 6, 11, 12); qr(2, 7, 8, 13); qr(3, 4, 9, 14)
+    words = T.stack([x[i] + st[i] for i in range(16)], dim=1)      # [N,16] int32
+    raw = words.view(T.uint8).reshape(N, 64)                       # CUDA 小端
+    return raw.reshape(B, blocks * 64)[:, :nbytes]
+
+
+def chacha20_keystream(keys, nonce, counter=0, nbytes=64, rfc7539=None):
+    """
+    批量生成 ChaCha20 密钥流。
+
+    keys   : [B,32] uint8 张量/ndarray（或 32 字节 bytes，单密钥）
+    nonce  : 12 字节（rfc7539）/ 8 字节（原版）
+    counter: 起始计数器（rfc7539 为 32 位；原版为 64 位）
+    rfc7539: None = 按 nonce 长度自动判断（12B→True，8B→False）
+    nbytes : 要生成的字节数（允许 0）
+    返回   : [B, nbytes] uint8 (numpy)
+
+    实现：uint32/int32 状态（内存减半）+ 所有块拼成 [B*blocks, 16] 一次跑完；
+    torch 张量输入时全程留在原 device，不再绕 numpy。
+    """
+    nonce, counter, nbytes, rfc7539, blocks = _chacha_parse(nonce, counter, nbytes, rfc7539)
     if isinstance(keys, (bytes, bytearray)):
         kb = np.frombuffer(bytes(keys), dtype=np.uint8)
         if kb.size != 32:
             raise ValueError(f'ChaCha20 密钥必须 32 字节，收到 {kb.size} 字节')
         keys = kb.reshape(1, 32)
-    k_np = (G.from_dev(keys) if (is_t and hasattr(keys, 'detach')) else np.asarray(keys))
+    if _is_torch():
+        T = G.torch
+        if isinstance(keys, np.ndarray):
+            keys_t = T.from_numpy(np.ascontiguousarray(keys, dtype=np.uint8)).to(_dev())
+        elif T.is_tensor(keys):
+            keys_t = keys.detach()
+            if keys_t.device != _dev():
+                keys_t = keys_t.to(_dev())
+            if keys_t.dtype != T.uint8:
+                keys_t = keys_t.to(T.uint8)
+        else:
+            keys_t = T.tensor(np.ascontiguousarray(keys, dtype=np.uint8), device=_dev())
+        if keys_t.dim() != 2 or int(keys_t.shape[1]) != 32:
+            raise ValueError(f'keys 形状应为 [B,32]，收到 {tuple(keys_t.shape)}')
+        if nbytes == 0:
+            return np.zeros((int(keys_t.shape[0]), 0), dtype=np.uint8)
+        return _chacha20_ks_torch(keys_t, nonce, counter, nbytes, rfc7539).cpu().numpy()
+    k_np = np.asarray(keys)
     if k_np.ndim != 2 or k_np.shape[1] != 32:
         raise ValueError(f'keys 形状应为 [B,32]，收到 {k_np.shape}')
-    B = k_np.shape[0]
-    if nbytes == 0:                              # 空请求：直接给空结果，别进 block 循环
-        return np.zeros((B, 0), dtype=np.uint8)
+    return _chacha20_ks_numpy(np.ascontiguousarray(k_np, dtype=np.uint8),
+                              nonce, counter, nbytes, rfc7539)
 
-    nb = np.frombuffer(nonce, dtype=np.uint8)
-    const = np.frombuffer(b'expand 32-byte k', dtype=np.uint8)
 
-    def w(a):                                    # 4 字节小端 → uint32
-        a = [int(v) for v in a]
-        return (a[0] | (a[1] << 8) | (a[2] << 16) | (a[3] << 24)) & M32
+def _chacha_brute_batch(keys, nonce, counter, target, rfc7539):
+    """一批候选密钥的 keystream vs 目标比较，返回批内命中事件列表。
 
-    st = np.zeros((B, 16), dtype=np.int64)
-    for i in range(4):
-        st[:, i] = w(const[4 * i:4 * i + 4])
-    for i in range(8):
-        st[:, 4 + i] = (k_np[:, 4 * i].astype(np.int64)
-                        | (k_np[:, 4 * i + 1].astype(np.int64) << 8)
-                        | (k_np[:, 4 * i + 2].astype(np.int64) << 16)
-                        | (k_np[:, 4 * i + 3].astype(np.int64) << 24))
-    if rfc7539:
-        st[:, 12] = counter & M32
-        for i in range(3):
-            st[:, 13 + i] = w(nb[4 * i:4 * i + 4])
-    else:
-        # 原版 ChaCha20：counter 占 words 12-13（64 位），nonce 占 words 14-15
-        st[:, 12] = counter & M32
-        st[:, 13] = (counter >> 32) & M32
-        st[:, 14] = w(nb[0:4]); st[:, 15] = w(nb[4:8])
-    ctr_lo = int(counter) & M32
-    ctr_hi = (int(counter) >> 32) & M32
-
-    st = (T.tensor(st, dtype=T.int64, device=_dev()) if is_t else st)
-    outs = []
-    for bi in range(blocks):
-        if bi > 0:
-            # 每个 block 计数器 +1；原版变体是 64 位计数器（words 12-13），需要处理进位
-            ctr_lo = (ctr_lo + 1) & M32
-            if ctr_lo == 0:
-                ctr_hi = (ctr_hi + 1) & M32
-            if is_t:
-                st = st.clone()
-                st[:, 12] = ctr_lo
-                if not rfc7539:
-                    st[:, 13] = ctr_hi
-            else:
-                st = st.copy()
-                st[:, 12] = ctr_lo
-                if not rfc7539:
-                    st[:, 13] = ctr_hi
-        x = [st[:, i].clone() if is_t else st[:, i].copy() for i in range(16)]
-
-        def qr(a, b, c, d):
-            a = (a + b) & M32; d ^= a; d = _rotl(d, 16)
-            c = (c + d) & M32; b ^= c; b = _rotl(b, 12)
-            a = (a + b) & M32; d ^= a; d = _rotl(d, 8)
-            c = (c + d) & M32; b ^= c; b = _rotl(b, 7)
-            return a, b, c, d
-
-        for _ in range(10):
-            x[0], x[4], x[8], x[12] = qr(x[0], x[4], x[8], x[12])
-            x[1], x[5], x[9], x[13] = qr(x[1], x[5], x[9], x[13])
-            x[2], x[6], x[10], x[14] = qr(x[2], x[6], x[10], x[14])
-            x[3], x[7], x[11], x[15] = qr(x[3], x[7], x[11], x[15])
-            x[0], x[5], x[10], x[15] = qr(x[0], x[5], x[10], x[15])
-            x[1], x[6], x[11], x[12] = qr(x[1], x[6], x[11], x[12])
-            x[2], x[7], x[8], x[13] = qr(x[2], x[7], x[8], x[13])
-            x[3], x[4], x[9], x[14] = qr(x[3], x[4], x[9], x[14])
-        parts = [((x[i] + st[:, i]) & M32) for i in range(16)]
-        word = T.stack(parts, dim=1) if is_t else np.stack(parts, axis=1)   # [B,16] uint32
-        # words → 小端字节（统一用 Python int 位移，避免 int64×uint64 提升问题）
-        if is_t:
-            bs = T.stack([(word >> (8 * j)) & 0xFF for j in range(4)], dim=2).reshape(B, 64)
-        else:
-            bs = np.stack([(word >> (8 * j)) & 0xFF for j in range(4)], axis=2).reshape(B, 64)
-        outs.append(bs)
-    out = T.cat(outs, dim=1) if is_t else np.concatenate(outs, axis=1)
-    return G.from_dev(out)[:, :nbytes].astype(np.uint8)   # 统一返回 numpy
+    keys 为 torch 张量时全流程留在 GPU（生成→密钥流→比较→只回传命中的 key）；
+    为 numpy 数组时走 numpy 后端。命中事件的 index 是**批内下标**，由调用方加偏移。
+    """
+    target_b = bytes(target)
+    if G.torch is not None and G.torch.is_tensor(keys):
+        T = G.torch
+        ks = _chacha20_ks_torch(keys, nonce, counter, len(target_b), rfc7539)
+        tgt = T.from_numpy(np.frombuffer(target_b, dtype=np.uint8).copy()).to(keys.device)
+        eq = (ks == tgt).all(dim=1)
+        idx = T.nonzero(eq, as_tuple=False).flatten()
+        if int(idx.numel()) == 0:
+            return []
+        ic = idx.cpu().tolist()
+        kc = keys[idx].cpu().numpy()
+        return [{'event': 'hit', 'kind': 'chacha', 'index': int(i),
+                 'key': kc[j].tobytes().hex()} for j, i in enumerate(ic)]
+    keys_np = keys if isinstance(keys, np.ndarray) else np.asarray(keys, dtype=np.uint8)
+    ks = chacha20_keystream(keys_np, nonce, counter, len(target_b), rfc7539)
+    eq = (ks == np.frombuffer(target_b, dtype=np.uint8)).all(1)
+    return [{'event': 'hit', 'kind': 'chacha', 'index': int(i),
+             'key': keys_np[i].tobytes().hex()} for i in np.nonzero(eq)[0]]
 
 
 def chacha_brute(nonce, counter, target, tries, rfc7539, chunk=1 << 14, checkpoint='',
@@ -263,6 +376,7 @@ def chacha_brute(nonce, counter, target, tries, rfc7539, chunk=1 << 14, checkpoi
 
     按块调度（ctf_common.chunked）：--chunk 为每块候选数，--checkpoint 可续跑；
     进度/ETA 只写 stderr（--quiet / --no-progress 可关），不污染 stdout 结果流。
+    torch-CUDA 时随机密钥在显存里生成、keystream 与比较全在 GPU，只回传命中项。
     返回 (done, hits, seconds)，hits 为 hit 事件 dict（index/key）。
     """
     tries, chunk = int(tries), int(chunk)
@@ -270,17 +384,31 @@ def chacha_brute(nonce, counter, target, tries, rfc7539, chunk=1 << 14, checkpoi
         raise ValueError(f'--chunk 必须 >= 1（chunk={chunk}）')
     if tries < 1:
         raise ValueError(f'--tries 必须 >= 1（tries={tries}）')
-    target_t = np.frombuffer(bytes(target), dtype=np.uint8)
-    rng = np.random.default_rng(int(seed))
+    target_b = bytes(target)
+    if _is_gpu():
+        T = G.torch
+        dev = _dev()
+        gen = T.Generator(device=dev)
+        gen.manual_seed(int(seed))
 
-    def fn(lo, hi):
-        n = hi - lo
-        keys = rng.integers(0, 256, (n, 32), dtype=np.uint8)
-        ks = chacha20_keystream(keys, nonce, counter, len(target_t), rfc7539)
-        eq = (ks == target_t).all(1)
-        got = [{'event': 'hit', 'kind': 'chacha', 'index': int(lo + i),
-                'key': keys[i].tobytes().hex()} for i in np.nonzero(eq)[0]]
-        return n, got
+        def fn(lo, hi):
+            n = hi - lo
+            keys = T.randint(0, 256, (n, 32), generator=gen, device=dev,
+                             dtype=T.uint8)
+            got = _chacha_brute_batch(keys, nonce, counter, target_b, rfc7539)
+            for h in got:
+                h['index'] = int(lo) + h['index']
+            return n, got
+    else:
+        rng = np.random.default_rng(int(seed))
+
+        def fn(lo, hi):
+            n = hi - lo
+            keys = rng.integers(0, 256, (n, 32), dtype=np.uint8)
+            got = _chacha_brute_batch(keys, nonce, counter, target_b, rfc7539)
+            for h in got:
+                h['index'] = int(lo) + h['index']
+            return n, got
 
     def on_hit(got):
         return True                                    # 命中即早停
@@ -291,10 +419,10 @@ def chacha_brute(nonce, counter, target, tries, rfc7539, chunk=1 << 14, checkpoi
                                # meta 指纹：不同 nonce/counter/目标长度/变体的任务不串用断点
                                ckpt_meta={'cmd': 'chacha', 'nonce': bytes(nonce).hex(),
                                           'counter': int(counter),
-                                          'target_len': int(len(target_t)),
+                                          'target_len': int(len(target_b)),
                                           'rfc7539': bool(rfc7539),
                                           'target_sha': hashlib.sha256(
-                                              bytes(target_t)).hexdigest()[:16]})
+                                              target_b).hexdigest()[:16]})
     # 断点文件可能来自别的命令/旧格式：只认本命令的 dict 事件
     hits = [h for h in hits if isinstance(h, dict) and h.get('kind') == 'chacha']
     return done, hits, dt
@@ -586,57 +714,250 @@ def _xor_keys(klen, first, count):
                      for i in range(klen)], axis=1).astype(np.uint8)
 
 
+# 小写映射表（GPU 打分用）：ASCII 大写 → 小写，其余不变
+_LOW256 = np.arange(256, dtype=np.uint8)
+_LOW256[(_LOW256 >= 0x41) & (_LOW256 <= 0x5A)] += np.uint8(32)
+_FLAG_SEQS = tuple(w + b'{' for w in _FLAG_WORDS)
+_XOR_TIE_BASE = 1 << 25          # > 最大候选批大小，用于把「分数 + 下标」编码成单键
+
+
+def _xor_select(sc, k):
+    """批内 top-k：**分数降序、批内候选下标降序**（CPU/GPU 共用的确定性并列规则）。
+
+    旧实现 `np.argsort(sc)[-k:][::-1]` 在并列分数时的次序取决于 numpy 排序实现，
+    CPU 与 GPU 无法逐项对拍。这里改成显式确定性规则：把 (score, index) 编码为
+    唯一 int64 键，取最小的 k 个，因此 CPU/GPU/不同 chunk 下结果完全一致。
+    """
+    cnt = int(sc.size)
+    tie = -(sc.astype(np.int64) * _XOR_TIE_BASE) - np.arange(cnt, dtype=np.int64)
+    if k < cnt:
+        idx = np.argpartition(tie, k - 1)[:k]
+        return idx[np.argsort(tie[idx])]
+    return np.argsort(tie)
+
+
+def _xor_oom(exc):
+    name = type(exc).__name__.lower()
+    text = str(exc).lower()
+    return 'outofmemory' in name or 'out of memory' in text or \
+        ('cuda error' in text and 'memory' in text)
+
+
 class _XorScanner:
-    """重复 XOR 候选空间的确定性分块扫描器。
+    """重复 XOR 候选空间的确定性分块扫描器（numpy / CPU 路径）。
 
     候选按「密钥长度段 + 段内固定批次」切批（批次大小只由内存决定，与 --chunk 无关），
     跨块边界的不完整批次留到下一次 fn 调用凑满再打分。因此：
       * 同一输入/参数下结果与 --chunk / --checkpoint 粒度无关（含并列分数的次序）；
       * --chunk 只影响进度/断点落盘频率，不会拖慢内核（不会把批次切碎）。
+    GPU 子类只替换 `_process`：用更大的 wave 一次算多个批次，但**每批仍按同一规则
+    各自选 top-k**，所以 CPU/GPU 输出逐项一致。
     """
 
-    def __init__(self, d, n, max_len, top):
+    def __init__(self, d, n, max_len, top, end=None):
         self.d = d
         self.n = int(n)
         self.max_len = int(max_len)
         self.top = int(top)
+        self.end = int(end) if end is not None else None
         self.vec = max(1, 4_000_000 // max(1, self.n))   # 单批 4M 字节单元
-        self.pending = None                              # (klen, base, s, e)
+        self.pending = None                              # 不完整批次 (klen, base, s, e)
+        self.pending_batches = []                        # 已凑满、待打分的批次
+        self.wave = 1                                    # 一次 _process 最多几个批次
 
-    def _score(self, klen, base, s, e):
+    def _batch_end(self, pos):
+        """返回 pos 所在批次的 (klen, base, b_start, b_end)。"""
+        klen, base, _ = _xor_split(pos, self.max_len)
+        b_start = base + ((pos - base) // self.vec) * self.vec
+        return klen, base, b_start, min(b_start + self.vec, base + 256 ** klen)
+
+    def _score_batch(self, klen, base, s, e):
         cnt = e - s
         kb = _xor_keys(klen, s - base, cnt)
         ks = np.tile(kb, (1, (self.n + klen - 1) // klen))[:, :self.n]
         pt = self.d[None, :] ^ ks
         sc = _score_plaintext(pt)
-        m = min(self.top, int(sc.size))
-        idx = np.argsort(sc)[-m:][::-1]
+        idx = _xor_select(sc, min(self.top, cnt))
         return [{'event': 'hit', 'kind': 'xorbrute', 'score': int(sc[i]),
                  'key': kb[i].tobytes().hex(),
                  'plaintext': pt[i].tobytes().hex()} for i in idx]
 
+    def _process(self, batches):
+        out = []
+        for b in batches:
+            out += self._score_batch(*b)
+        return out
+
     def fn(self, lo, hi):
         lo, hi = int(lo), int(hi)
-        got = []
         pos = lo
         if self.pending is not None:
             klen, base, s, e = self.pending
             if hi < e:                       # 批次还没凑满：等下一个块
-                return hi - lo, got
-            got += self._score(klen, base, s, e)
+                return hi - lo, []
+            self.pending_batches.append((klen, base, s, e))
             self.pending = None
             pos = e
+        else:
+            # 断点续跑可能落在批次中间：该批上次未完成（无 hits），从批起点重扫
+            _, _, b_start, _ = self._batch_end(pos)
+            if b_start < pos:
+                pos = b_start
         while pos < hi:
-            klen, base, _ = _xor_split(pos, self.max_len)
-            b_end = min(base + ((pos - base) // self.vec) * self.vec + self.vec,
-                        base + 256 ** klen)
+            klen, base, b_start, b_end = self._batch_end(pos)
             if b_end <= hi:
-                got += self._score(klen, base, pos, b_end)
+                self.pending_batches.append((klen, base, pos, b_end))
                 pos = b_end
             else:                            # 余下的是不完整批次
                 self.pending = (klen, base, pos, b_end)
-                return hi - lo, got
+                break
+        if not self.pending_batches:
+            return hi - lo, []
+        flush = (self.end is not None and hi >= self.end) or len(self.pending_batches) >= self.wave
+        if not flush:
+            return hi - lo, []
+        batches = self.pending_batches
+        self.pending_batches = []
+        try:
+            got = self._process(batches)
+        except Exception:
+            self.pending = None              # 让重试从批边界重新开始
+            raise
         return hi - lo, got
+
+
+class _XorScannerGPU(_XorScanner):
+    """torch-CUDA 扫描器：候选键生成 / 明文异或 / 整数打分 / top-k 全在 GPU。
+
+    与 CPU 路径共用同一批次划分与 `_xor_select` 并列规则；每 wave 把若干连续批次
+    拼成一个大张量一次算完（提升 GPU 占用率），再按批次切片各自选 top-k。
+    """
+
+    def __init__(self, d, n, max_len, top, end=None):
+        super().__init__(d, n, max_len, top, end)
+        T = G.torch
+        self._T = T
+        self._dev = _dev()
+        self._d_t = T.from_numpy(d.copy()).to(self._dev)
+        w8 = _W256.astype(np.int8)
+        self._w8g = T.from_numpy(np.ascontiguousarray(w8)).to(self._dev)
+        self._lowg = T.from_numpy(np.ascontiguousarray(_LOW256)).to(self._dev)
+        self._seqs = [T.from_numpy(np.frombuffer(s, dtype=np.uint8).copy()).to(self._dev)
+                      for s in _FLAG_SEQS]
+        self._pat = {k: T.tensor([i % k for i in range(self.n)],
+                                 dtype=T.int64, device=self._dev)
+                     for k in range(1, self.max_len + 1)}
+        self.wave = self._pick_wave()
+
+    def _pick_wave(self):
+        T = self._T
+        try:
+            free, _total = T.cuda.mem_get_info()
+        except Exception:
+            free = 1 << 30
+        cells = max(1, self.vec * self.n)                  # 单批元素数
+        # 每元素峰值约 12 字节（int32 索引 + 查找表 + 若干 bool 临时量）
+        budget_cells = max(1, int(free * 0.25 / 12))
+        return max(1, min(8, budget_cells // cells))
+
+    def _keys_gpu(self, klen, first, count):
+        T = self._T
+        idx = T.arange(int(first), int(first) + int(count), dtype=T.int64,
+                       device=self._dev)
+        return T.stack([((idx >> (8 * (klen - 1 - i))) & 0xFF).to(T.uint8)
+                        for i in range(klen)], dim=1)
+
+    def _score_gpu(self, pt):
+        T = self._T
+        cnt, L = int(pt.shape[0]), int(pt.shape[1])
+        flat = pt.reshape(-1).to(T.int32)
+        w = self._w8g.index_select(0, flat).view(cnt, L)
+        sc = w.sum(dim=1, dtype=T.int32)
+        low = self._lowg.index_select(0, flat).view(cnt, L)
+        printable = ((pt >= 0x20) & (pt <= 0x7E)).all(dim=1)
+        has_close = (pt == 0x7D).any(dim=1)
+        flag = T.zeros(cnt, dtype=T.bool, device=self._dev)
+        if L >= 4:
+            for seq in self._seqs:
+                k = int(seq.numel())
+                if k > L:
+                    continue
+                hit = low[:, 0:L - k + 1] == seq[0]
+                for j in range(1, k):
+                    hit &= (low[:, j:L - k + 1 + j] == seq[j])
+                flag |= hit.any(dim=1)
+            wordc = ((low >= 0x61) & (low <= 0x7A)) | (low == 0x5F)
+            generic = (wordc[:, :-3] & wordc[:, 1:-2] & wordc[:, 2:-1]
+                       & (low[:, 3:] == 0x7B)).any(dim=1)
+        else:
+            generic = T.zeros(cnt, dtype=T.bool, device=self._dev)
+        sc = sc + flag.to(T.int32) * 80
+        sc = sc + (printable & generic & has_close).to(T.int32) * 20
+        sc = sc + (printable & has_close).to(T.int32) * 5
+        return sc
+
+    def _score_wave(self, group):
+        try:
+            return self._score_wave_impl(group)
+        except Exception as exc:
+            if _xor_oom(exc):
+                try:
+                    self._T.cuda.empty_cache()
+                except Exception:
+                    pass
+                if len(group) > 1:
+                    mid = len(group) // 2
+                    return self._score_wave(group[:mid]) + self._score_wave(group[mid:])
+            raise
+
+    def _score_wave_impl(self, group):
+        T = self._T
+        klen = group[0][0]
+        s0 = group[0][2]
+        total = group[-1][3] - s0
+        kb = self._keys_gpu(klen, s0 - group[0][1], total)      # [total,klen] uint8
+        ks = kb.index_select(1, self._pat[klen])                # [total,n] uint8
+        pt = self._d_t.unsqueeze(0) ^ ks
+        sc = self._score_gpu(pt)
+        out = []
+        off = 0
+        dev = self._dev
+        for (kl, base, s, e) in group:
+            cnt = e - s
+            sub = sc[off:off + cnt]
+            k = min(self.top, cnt)
+            ar = T.arange(cnt, dtype=T.int64, device=dev)
+            tie = -(sub.to(T.int64) * _XOR_TIE_BASE) - ar
+            if k < cnt:
+                sel = T.topk(tie, k, largest=False, sorted=True).indices
+            else:
+                sel = T.argsort(tie)
+            sel_np = sel.cpu().numpy()
+            sc_np = sub.index_select(0, sel).cpu().numpy()
+            pt_rows = pt[off:off + cnt].index_select(0, sel).cpu().numpy()
+            koff = s - base
+            for t, i in enumerate(sel_np):
+                ki = koff + int(i)
+                out.append({'event': 'hit', 'kind': 'xorbrute',
+                            'score': int(sc_np[t]),
+                            'key': ki.to_bytes(klen, 'big').hex(),
+                            'plaintext': pt_rows[t].tobytes().hex()})
+            off += cnt
+        return out
+
+    def _process(self, batches):
+        out = []
+        i = 0
+        nb = len(batches)
+        while i < nb:
+            klen = batches[i][0]
+            j = i + 1
+            while (j < nb and batches[j][0] == klen and (j - i) < self.wave
+                   and batches[j][2] == batches[j - 1][3]):
+                j += 1
+            out += self._score_wave(batches[i:j])
+            i = j
+        return out
 
 
 def _xorbrute_scan(data, max_len=3, top=10, chunk=1 << 14, checkpoint='',
@@ -645,6 +966,8 @@ def _xorbrute_scan(data, max_len=3, top=10, chunk=1 << 14, checkpoint='',
 
     候选空间按 1..max_len 字节密钥顺序编号为一个全局序列，因此断点文件里的 next
     就是全局候选序号：中断后续跑不会重复扫描，也不会漏掉后面的密钥长度。
+    有 GPU 时自动走 `_XorScannerGPU`（打分/top-k 全在显存），否则走 numpy 路径；
+    两条路径共用同一批次划分与并列规则，结果逐项一致。
     """
     d = np.frombuffer(bytes(data), dtype=np.uint8)
     n = len(d)
@@ -659,7 +982,10 @@ def _xorbrute_scan(data, max_len=3, top=10, chunk=1 << 14, checkpoint='',
     if chunk < 1:
         raise ValueError(f'--chunk 必须 >= 1（chunk={chunk}）')
     total = sum(256 ** k for k in range(1, max_len + 1))
-    scanner = _XorScanner(d, n, max_len, top)
+    cls = _XorScannerGPU if _is_gpu() else _XorScanner
+    scanner = cls(d, n, max_len, top, end=total)
+    if checkpoint:
+        scanner.wave = 1                 # 断点模式下每块立刻出 hits，避免跨块丢结果
     done, hits, dt = C.chunked(
         scanner.fn, total, 0, chunk=chunk, label='xorbrute',
         checkpoint=checkpoint, reset=reset, progress=progress,
@@ -907,12 +1233,96 @@ def cmd_selftest(a):
                 _, x3, _ = _xorbrute_scan(b'abd', 1, 3, chunk=64, checkpoint=ckx,
                                           progress=False)     # 换密文 -> 指纹不一致
             ok_ck = (nxt == 4 and d1 == 4 and d2 == 0 and d3 == 2 and d4 == 4
-                     and x1 == 256 and x2 == 128 and x3 == 256 and r2
-                     # x2=128 且候选密钥序号都 >=128，证明是从断点位置续跑而非重扫
-                     and all(int(q[1], 16) >= 128 for q in r2))
+                     and x1 == 256 and x2 == 128 and x3 == 256 and r2 == r1)
+            # 断点若落在批次中间，该批上次未完成 → 从头重扫整批：r2 必须与完整扫描 r1 逐项一致
         except Exception:
             ok_ck = False
     check('[断点续跑]', ok_ck)
+
+    # --- ChaCha20 多块并行：一次算完 [B*blocks,16]；独立期望值来自 pycryptodome ---
+    ks_mb_rfc = bytes(chacha20_keystream(
+        bytes(range(32)), bytes.fromhex('000000090000004a00000000'), 1, 192)[0])
+    ks_mb_orig = bytes(chacha20_keystream(
+        bytes(range(32)), bytes(8), 0x12345678, 192, False)[0])
+    ks_mb_edge = bytes(chacha20_keystream(
+        bytes(range(32)), bytes.fromhex('000000090000004a00000000'), 0xFFFFFFF0, 200)[0])
+    ok_mb = (
+        ks_mb_rfc.hex() ==
+        '10f1e7e4d13b5915500fdd1fa32071c4c7d1f4c733c068030422aa9ac3d46c4e'
+        'd2826446079faa0914c2d705d98b02a2b5129cd1de164eb9cbd083e8a2503c4e'
+        '0a88837739d7bf4ef8ccacb0ea2bb9d69d56c394aa351dfda5bf459f0a2e9fe8'
+        'e721f89255f9c486bf21679c683d4f9c5cf2fa27865526005b06ca374c86af3bd'
+        'cbfbdcb83be65862ed5c20eae5a43241d6a92da6dca9a156be25297f51c27188'
+        'a861e93cc3aeb129a76598baccd27453ac6941b4b4e1e5153a9fee95d1ba00e' and
+        ks_mb_orig.hex() ==
+        '75453f6602f673f4ff0449d7afd8928b59d0dd3ced361409e11f16dd82ae81d2'
+        '8c9839483395fcaa3ffab58e26a1c1a44d20d5465794ab6abb7ba6c44a387ab3'
+        '6647b996f50d5576a16f05578789b7bb474a8378683be8341981d0e142f1fc20'
+        '91e78120b490ff281dbec457d84317c7b345f8776a0a9e4b00924c009f80f84c'
+        '6c11a9f2e49b4525aa47aa960d9b3c006bf6745df81c50eb1de93fc6335ae9e8'
+        '6869d95b4613dd7d090e60974b92308028167ddff76118dd48da707d432c353a' and
+        ks_mb_edge.hex() ==
+        '38fa98b60c9da1221eaf7b270e2e49ee1f0f354c7b23e825cd433bbc8913ee56'
+        '51fead1f95f2cd054c9cd3d6b5a958847322b6d286f7d32e7f90c84e8f5a2d07'
+        'aa355697297cd8fd5f72ba27d1d314cfb5fbc23689527be5afe46cc2f54eb265'
+        '8972003ca549685923c263f61149a2f580622dae6ba617e7c23018bb420085e1'
+        '8778122a75160d743d320ebe7fe966e9a82eef3d5bcb59e79a0cd9236b53e3aa'
+        '5f5575892d8050d2df7692d672441988b511db4f5ec345535d86b2ec7224cbfa'
+        '9c4f11fead68ddcc')
+    check('[ChaCha20 多块并行]', ok_mb)
+
+    # --- GPU 内核 vs numpy 内核逐字节对拍（无 GPU 时跳过）---
+    ok_kg = True
+    kg_note = ' (无 GPU，跳过)'
+    if _is_gpu():
+        rnd2 = np.random.default_rng(20261110)
+        keys_np = rnd2.integers(0, 256, (64, 32), dtype=np.uint8)
+        for nl_, rfc_, nb_ in ((12, True, 64), (12, True, 200),
+                               (8, False, 64), (8, False, 200)):
+            nce = bytes(rnd2.integers(0, 256, nl_, dtype=np.uint8))
+            ref = _chacha20_ks_numpy(keys_np, nce, 7, nb_, rfc_)
+            keys_t = G.torch.from_numpy(keys_np.copy()).to(_dev())
+            got = _chacha20_ks_torch(keys_t, nce, 7, nb_, rfc_).cpu().numpy()
+            ok_kg = ok_kg and np.array_equal(ref, got)
+        kg_note = ''
+    check('[ChaCha20 GPU 内核]', ok_kg, kg_note)
+
+    # --- chacha --brute GPU 命中路径：GPU 生成 keys → GPU keystream → GPU 比较 ---
+    ok_bh = True
+    bh_note = ' (无 GPU，跳过)'
+    if _is_gpu():
+        nonce_b = bytes.fromhex('000000090000004a00000000')
+        k_np = np.frombuffer(bytes(range(32)), dtype=np.uint8).reshape(1, 32)
+        tgt = bytes(chacha20_keystream(bytes(range(32)), nonce_b, 3, 64, True)[0])
+        k_t = G.torch.from_numpy(k_np.copy()).to(_dev())
+        got_hits = _chacha_brute_batch(k_t, nonce_b, 3, tgt, True)
+        miss = _chacha_brute_batch(k_t, nonce_b, 4, tgt, True)
+        ok_bh = (len(got_hits) == 1 and got_hits[0]['index'] == 0
+                 and got_hits[0]['key'] == bytes(range(32)).hex() and not miss)
+        bh_note = ''
+    check('[chacha brute GPU 命中]', ok_bh, bh_note)
+
+    # --- xorbrute 并列次序（确定性规则）+ GPU/CPU 结果逐项一致 ---
+    ok_tie = _xor_select(np.array([5, 5, 3, 5, 1, 5], dtype=np.int64), 3).tolist() == [5, 3, 1]
+    check('[xorbrute 并列次序]', ok_tie)
+    ok_par = True
+    par_note = ' (无 GPU，跳过)'
+    if _is_gpu():
+        orig_backend = G.BACKEND
+        rnd3 = np.random.default_rng(7)
+        samples = [bytes(rnd3.integers(0, 256, 16, dtype=np.uint8)),
+                   bytes(rnd3.integers(0, 256, 7, dtype=np.uint8)),
+                   b'flag{xor_gpu_selftest}']
+        try:
+            G.init_backend('numpy')
+            cpu_res = [xorbrute(c, max_len=2, top=8) for c in samples]
+            G.init_backend('torch')
+            gpu_res = [xorbrute(c, max_len=2, top=8) for c in samples]
+            ok_par = cpu_res == gpu_res
+        finally:
+            G.init_backend('torch' if orig_backend.startswith('torch') else 'numpy')
+        par_note = ''
+    check('[xorbrute GPU==CPU]', ok_par, par_note)
 
     # --- 性能 ---
     print('\n[性能]')
@@ -982,8 +1392,11 @@ def cmd_chacha(a):
     elif a.brute:
         if not C.json_mode():
             print('[brute] 随机密钥搜索（仅为演示吞吐；真实场景用 --keys-file 或直接生成候选）')
+        chunk = a.chunk
+        if chunk is None:                     # 默认：GPU 用大块（≥262144）吃满显存带宽
+            chunk = 262144 if _is_gpu() else (1 << 14)
         done, hits, dt = chacha_brute(nonce, a.counter, target, a.tries, rfc7539,
-                                      chunk=a.chunk, checkpoint=a.checkpoint,
+                                      chunk=chunk, checkpoint=a.checkpoint,
                                       reset=a.reset_checkpoint,
                                       progress=not a.no_progress)
         found = bool(hits)
@@ -1188,8 +1601,9 @@ def cmd_xorbrute(a):
     if not data:
         raise ValueError('--data-hex 不能为空')
     t0 = time.time()
+    chunk = a.chunk if a.chunk is not None else (1 << 14)
     res, done, dt = _xorbrute_scan(data, max_len=a.max_len, top=a.top,
-                                   chunk=a.chunk, checkpoint=a.checkpoint,
+                                   chunk=chunk, checkpoint=a.checkpoint,
                                    reset=a.reset_checkpoint,
                                    progress=not a.no_progress)
     if C.json_mode():
@@ -1208,13 +1622,14 @@ def main():
         description='ctf_tools — CTF 密码学内核（完整说明见 CLI_REFERENCE.md）')
     ap.add_argument('--backend', default='auto', choices=['auto', 'torch', 'numpy'],
                     help='计算后端：auto=torch-cuda→torch-cpu→numpy（默认 auto）')
-    ap.add_argument('--chunk', type=int, default=1 << 14,
-                    help='每批候选数 / 断点粒度（默认 16384；chacha --brute、xorbrute 用）')
+    ap.add_argument('--chunk', type=int, default=None,
+                    help='每批候选数 / 断点粒度（默认：chacha --brute 在 GPU 上 262144、'
+                         '其它 16384；xorbrute 默认 16384）')
     C.add_output_args(ap)
     C.add_sched_args(ap)
     sub = ap.add_subparsers(dest='cmd', required=True,
                             metavar='{selftest,chacha,poly1305,rs63,crc32,xorbrute,aesctr}')
-    sub.add_parser('selftest', help='已知向量自测（13 项；全 PASS 退出码 0）')
+    sub.add_parser('selftest', help='已知向量自测（18 项；全 PASS 退出码 0）')
 
     p = sub.add_parser('chacha', help='ChaCha20 密钥流生成 / 候选密钥扫描')
     p.add_argument('--target-hex', required=True, help='目标密钥流，hex（>=1 字节）')

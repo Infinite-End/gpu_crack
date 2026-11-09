@@ -7,9 +7,9 @@ description: GPU-accelerated, command-line CTF toolkit in this repository for ba
 
 | 文档属性 | 值 |
 |---|---|
-| 文档版本 | v3.4（2026-11-09） |
+| 文档版本 | v3.5（2026-11-10） |
 | 适用工具 | gpu_crack toolkit v2（仓库根目录） |
-| 校验状态 | `python -X utf8 verify_all.py` 六层全绿（doc_lint 50 / 模块 13+31+23 / 主框架 42 / consistency 45/45 / fuzz 17 类 / 统一入口+示例 6/6） |
+| 校验状态 | `python -X utf8 verify_all.py` 六层全绿（doc_lint 50 / 模块 18+32+23 / 主框架 54 / consistency 45/45 / fuzz 17 类 / 统一入口+示例 6/6） |
 | 配套文档 | `CLI_REFERENCE.md`（仓库根，规范性参数/输出/退出码）、`README.md`（仓库根）、`references/kernels.md`、`SKILL.en.md`（英文精简版） |
 | 内核清单 | 真源 `ctf_registry.py`（含 `VERSION`）；插件放 `plugins/*.py`（模块级 `KERNEL` 元数据），不改仓库即可扩展；插件不计入 30 个内置子命令 |
 
@@ -26,8 +26,9 @@ description: GPU-accelerated, command-line CTF toolkit in this repository for ba
 | 解释器缓存 | 探测结果缓存在用户缓存目录（`%LOCALAPPDATA%\gpu_crack\` 或 `~/.cache/gpu_crack/`）；`CTF_NO_PY_CACHE=1` 关闭，`CTF_PY_CACHE=路径` 改位置 |
 | 统一入口 | `scripts/ctf.py`（本 skill 内）；`selfcheck` 可自检入口本身，`help <module>` 看单模块帮助 |
 | 参考文档 | `<skill>/references/kernels.md`（一页速查）、`CLI_REFERENCE.md`（完整参数/输出/退出码） |
-| 后端 | `--backend auto|torch|numpy`；`ctf_misc.py` 纯 CPU，无此参数 |
-| 分块 | `--chunk N`（gpu_crack 默认 65536、ctf_tools 默认 16384；**OOM 自动减半重试**） |
+| 后端 | `--backend auto|torch|numpy`；`ctf_misc.py` 纯 CPU，无此参数；CUDA 机器上 mtscan/lfsrscan 自动用原生 NVRTC 融合内核（`GPU_CRACK_NO_NATIVE=1` 可关） |
+| 分块 | `--chunk N`（不传=自动档；chacha --brute GPU 262144/CPU 16384、mtscan 原生最大 2^26；**OOM 自动减半重试**） |
+| GPU 利用率 | `python -X utf8 gpu_profile.py --inproc`（kernel 时间/launch 数）或 CLI 模式看 busy%/wall；改 GPU 内核后用它做 before/after |
 | 输出/调度 | `--json`（单行 JSON 结果）、`--quiet`、`--no-progress`、`--checkpoint FILE`、`--reset-checkpoint`（后五项 gpu_crack / ctf_tools / ctf_ext 支持，ctf_misc 不支持） |
 
 统一入口会自动挑解释器、把全局参数挪到正确位置。不确定时**优先用统一入口**：
@@ -150,6 +151,7 @@ python -X utf8 selftest.py                  # 第 3 层：主框架 AES/mt19937/
 python -X utf8 consistency.py               # 第 4 层：跨实现固定向量（通过 45/45）
 python -X utf8 fuzz_kernels.py --quick      # 第 5 层：17 类随机差分对拍
 python $ctf selftest                        # 第 6 层：统一入口组合自测
+python -X utf8 gpu_profile.py --selfcheck   # 附：GPU 利用率测量工具自检
 ```
 
 验收标准：① 已知向量 PASS；② 双后端一致；③ 参数错误是干净报错（rc=1/2，无 traceback）；

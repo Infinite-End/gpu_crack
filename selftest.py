@@ -3,7 +3,8 @@
 """gpu_crack.py 主框架自测：已知向量 + 双后端一致性 + 植入-找回 + CLI 契约。
 
 跑法：python -X utf8 selftest.py
-输出：每项 `[名称] PASS/FAIL`；末尾汇总。全部 PASS 退出码 0，否则 1。整套 <10s。
+输出：每项 `[名称] PASS/FAIL`；末尾汇总。全部 PASS 退出码 0，否则 1。
+整套约 20s（含原生 NVRTC 加速层对拍与 3 次 CLI 子进程 smoke；无 GPU 时更快）。
 """
 import contextlib
 import io
@@ -443,7 +444,7 @@ finally:
 
 # ================================================================ 10) 性能快速检查
 use('torch')
-if G.BACKEND.startswith('torch'):
+if G.BACKEND == 'torch-cuda':
     n = 1 << 16
     s = G.torch.arange(n, dtype=G.torch.int64, device=G.DEV)
     t0 = time.time()
@@ -468,10 +469,215 @@ if G.BACKEND.startswith('torch'):
     dt = time.time() - t0
     print(f'  [perf] AES-192 {b.shape[0]} blocks: {b.shape[0]/dt/1e6:6.2f} M blocks/s')
 else:
-    t0 = time.time()
-    G.mt19937_keys(np.arange(1 << 14, dtype=np.int64), twist=False)
-    print(f'  [perf] mt19937 numpy {1 << 14} seeds: {((1 << 14)/(time.time()-t0))/1e6:6.2f} M/s')
+    # torch-cpu / numpy 后端：不调用 torch.cuda.*（无 CUDA 时 synchronize 会抛
+    # "No CUDA GPUs are available"，CI 的 CPU-only 环境必须能过），性能项跳过。
+    print(f'  [perf] 跳过（{G.BACKEND}：无 CUDA；性能项只在本机 GPU 上跑）')
 
+G.init_backend('auto')
+
+# ================================================================ 11) 原生 NVRTC 融合内核 + 回退
+# 原生层是内部加速器：cmd_mtscan/cmd_lfsrscan 在 torch-cuda 后端上自动使用（BACKEND/xp()/DEV
+# 语义不变）；不可用或运行期失败时静默回退 torch/numpy 路径。这里对拍 + 回退 smoke。
+_native_ok = False
+try:
+    _native_ok = G._nv_available()
+except Exception:                                       # noqa: BLE001
+    _native_ok = False
+print(f'  [native] available={_native_ok}' + ('' if _native_ok else f'  ({G._NV_ERR})'))
+
+
+def _lfsr_ref_best(state_bits, taps, tbits):
+    """纯 Python Fibonacci 参考：返回一条初始状态的完整输出序列。"""
+    st = list(state_bits)
+    out = []
+    for _ in range(len(tbits)):
+        fb = 0
+        for t in taps:
+            fb ^= st[t - 1]
+        out.append(fb)
+        st = [fb] + st[:-1]
+    return out
+
+
+if _native_ok:
+    use('numpy')
+    rngn = np.random.default_rng(20261110)
+    ok_native = True
+    detail = ''
+    for tw in (False, True):
+        for L in (1, 2, 3, 5, 8, 16, 23, 24):
+            start = int(rngn.integers(-(2 ** 62), 2 ** 62))
+            count = 2048
+            seeds = start + np.arange(count, dtype=np.int64)
+            keys = np.asarray(G.mt19937_keys(seeds, twist=tw, nbytes=L))
+            pick = int(rngn.integers(0, count))
+            tgt = bytes(keys[pick].tolist())
+            hits, reported = G._NV.mt_scan(start, count, L, tw, tgt)
+            expected = sorted(int(seeds[i]) for i in range(count)
+                              if tuple(keys[i]) == tuple(tgt))
+            if hits != expected or reported != len(expected):
+                ok_native = False
+                detail = f'twist={int(tw)} L={L} hits={hits[:3]} expected={expected[:3]}'
+                break
+        if not ok_native:
+            break
+    check('原生融合内核 mt19937 == numpy 逐字节对拍（twist 0/1、L=1..24、负种子/边界）',
+          ok_native, detail)
+
+    # 1 字节目标：多命中必须全部返回且升序（atomicAdd 顺序需要归一化）
+    keys1 = np.asarray(G.mt19937_keys(np.arange(1 << 16, dtype=np.int64),
+                                      twist=False, nbytes=1))
+    hits, _n = G._NV.mt_scan(0, 1 << 16, 1, False, bytes(keys1[0].tolist()))
+    expected = [int(i) for i in range(1 << 16) if bytes(keys1[i]) == bytes(keys1[0])]
+    check('原生融合内核 1B 目标多命中全量返回且升序',
+          hits == expected and len(hits) > 64, f'{len(hits)} vs {len(expected)}')
+
+    # LFSR：原生内核 == numpy 位打包回退 >= 纯 Python 参考
+    rngl = np.random.default_rng(7)
+    ok_lfsr_native = True
+    detail = ''
+    for n_, taps_ in ((25, [10, 11, 24]), (28, [12, 22, 25]), (5, [1, 3, 5]),
+                      (63, [1, 32, 63])):
+        Tlen_ = 64
+        tbits = rngl.integers(0, 2, size=Tlen_, dtype=np.int64)
+        states = G._lfsr_gen_packed(rngl, 256, n_)
+        m_native = G._NV.lfsr_scan(states, n_, taps_, tbits)
+        m_np = G._lfsr_packed_best(states, taps_, tbits)
+        want = max(sum(a == b for a, b in zip(
+            _lfsr_ref_best([(int(v) >> j) & 1 for j in range(n_)], taps_, tbits.tolist()),
+            tbits.tolist())) for v in states[:128])
+        if not (m_native == m_np and m_native >= want):
+            ok_lfsr_native = False
+            detail = f'n={n_} taps={taps_} native={m_native} np={m_np} ref128={want}'
+            break
+    check('原生 LFSR 内核 == numpy 位打包回退 >= 纯 Python 参考（n≤63）',
+          ok_lfsr_native, detail)
+
+    # 原生调用后 torch 仍然可用（primary context 混用，不串流/不破坏 torch 状态）
+    use('torch')
+    tv = G.torch.ones(64, device=G.DEV) + 1.0
+    check('原生内核与 torch 同进程共存（primary context 混用）',
+          float(tv.sum().item()) == 128.0)
+
+# n>63 的兼容路径（逐 bit 状态矩阵，原生内核不支持，必须仍可用）
+use('numpy')
+a_big = A()
+a_big.taps = '70:1,2,3,69'
+a_big.bits = '0110100101'
+a_big.trials = 64
+a_big.rng_seed = 3
+out_big = io.StringIO()
+with contextlib.redirect_stdout(out_big), contextlib.redirect_stderr(io.StringIO()):
+    rc_big = G.cmd_lfsrscan(a_big)
+m_big = None
+for line in out_big.getvalue().splitlines():
+    if '最佳' in line and '/' in line:
+        try:
+            m_big = int(line.split('最佳')[1].split('/')[0].strip())
+        except ValueError:
+            m_big = None
+check('lfsrscan n>63 兼容路径可运行且输出最佳位数',
+      rc_big in (0, None) and m_big is not None and 0 <= m_big <= 10,
+      out_big.getvalue()[:120])
+
+# 强制关闭原生层：两条命令都必须回退 torch/numpy 且结果一致
+_old_nv, _old_tried = G._NV, G._NV_TRIED
+G._NV, G._NV_TRIED = False, True
+try:
+    use('torch')
+    buf_fb = io.StringIO()
+    with contextlib.redirect_stdout(buf_fb), contextlib.redirect_stderr(io.StringIO()):
+        G.cmd_mtscan(mtscan_args(RefMT(PLANT).keys().hex(), PLANT - 1000, 2000))
+    check('原生不可用时 mtscan 回退 torch 路径（植入-找回）', '★ 命中' in buf_fb.getvalue())
+
+    lfsr_fb = {}
+    for be in backends:
+        name = use(be)
+        a_l = A()
+        a_l.taps = '25:10,11,24'
+        a_l.bits = '1011010011'
+        a_l.trials = 32
+        a_l.rng_seed = 7
+        b2 = io.StringIO()
+        with contextlib.redirect_stdout(b2), contextlib.redirect_stderr(io.StringIO()):
+            G.cmd_lfsrscan(a_l)
+        lfsr_fb[be] = b2.getvalue()
+    check('原生关闭时 lfsrscan torch 位打包回退 == numpy 输出',
+          not has_torch() or lfsr_fb.get('torch') == lfsr_fb.get('numpy'))
+finally:
+    G._NV, G._NV_TRIED = _old_nv, _old_tried
+
+check('auto-chunk 档位：原生 64M / torch twist0 256K / twist1 64K',
+      G._native_mt_chunk(1 << 30) == (1 << 26)
+      and G._torch_mt_chunk(1 << 30, False) == (1 << 18)
+      and G._torch_mt_chunk(1 << 30, True) == (1 << 16))
+
+# bench --profile 输出契约（torch-cuda 上真实跑一次；JSON 模式追加 event=profile 对象）
+use('torch')
+if G.BACKEND == 'torch-cuda':
+    class _BA:
+        markdown = False
+        profile = True
+    _buf = io.StringIO()
+    G.C.set_output(True, True)
+    try:
+        with contextlib.redirect_stdout(_buf), contextlib.redirect_stderr(io.StringIO()):
+            G.cmd_bench(_BA())
+    finally:
+        G.C.set_output(False, False)
+    _events = []
+    for _ln in _buf.getvalue().splitlines():
+        if _ln.strip():
+            try:
+                _events.append(json.loads(_ln))
+            except json.JSONDecodeError:
+                _events.append({})
+    _profs = [e for e in _events if e.get('event') == 'profile']
+    _need = {'kernel', 'launches_per_call', 'gpu_ms_per_call', 'wall_ms_per_call', 'gpu_ratio'}
+    check('bench --profile 追加 event=profile（launch 数/GPU ms/占比 字段齐全）',
+          len(_profs) >= 3 and all(_need <= set(e) for e in _profs),
+          f'{len(_profs)} profile events')
+else:
+    print('  [bench] 非 torch-cuda 后端，跳过 --profile 契约（回退路径仍可运行）')
+
+# ---- CLI 子进程 smoke：默认 auto 路径（本机走原生融合内核；禁用时回退 torch）
+import subprocess                                           # noqa: E402
+
+
+def _cli(args, env_extra=None):
+    env = dict(os.environ)
+    env.update(env_extra or {})
+    try:
+        r = subprocess.run([sys.executable, '-X', 'utf8',
+                            os.path.join(ROOT, 'gpu_crack.py')] + args,
+                           cwd=ROOT, capture_output=True, text=True, env=env, timeout=180)
+        return r.returncode, r.stdout, r.stderr
+    except (OSError, subprocess.SubprocessError) as exc:     # noqa: BLE001
+        return -1, '', str(exc)
+
+
+_cli_key = RefMT(PLANT).keys().hex()
+_cli_base = ['--json', '--quiet', 'mtscan', '--key-hex', _cli_key,
+             '--seed-start', str(PLANT - 1000), '--seed-count', '2000']
+rc, out, err = _cli(_cli_base)
+check('CLI auto 路径（子进程）：mtscan 植入-找回',
+      rc == 0 and f'"seed":{PLANT}' in out and 'Traceback' not in err,
+      f'rc={rc} out={out[:100]!r} err={err[-160:]!r}')
+rc, out_off, err = _cli(_cli_base, {'GPU_CRACK_NO_NATIVE': '1'})
+check('CLI auto 路径（子进程）：GPU_CRACK_NO_NATIVE=1 回退 torch 仍命中',
+      rc == 0 and f'"seed":{PLANT}' in out_off, f'rc={rc} out={out_off[:100]!r}')
+
+# lfsrscan：CLI auto（原生）与 numpy 回退在同一 --rng-seed 下结果必须一致
+_cli_bits = '1011010011'
+use('numpy')
+_exp_best = G._lfsr_packed_best(
+    G._lfsr_gen_packed(np.random.default_rng(7), 32, 25), [10, 11, 24],
+    np.array([int(c) for c in _cli_bits], dtype=np.int64))
+rc, out_l, err = _cli(['--json', '--quiet', 'lfsrscan', '--taps', '25:10,11,24',
+                       '--bits', _cli_bits, '--trials', '32', '--rng-seed', '7'])
+check('CLI auto 路径（子进程）：lfsrscan 最佳位数与 numpy 位打包一致',
+      rc == 0 and f'"best":{_exp_best}' in out_l,
+      f'rc={rc} expect={_exp_best} out={out_l[:120]!r}')
 G.init_backend('auto')
 
 # ================================================================ 汇总

@@ -82,6 +82,9 @@ jobs:
       - name: Skill zip in sync (skill/ + toolkit -> skill.zip)
         run: python -X utf8 build_skill_zip.py --check
 
+      - name: GPU profile tool self-check (no GPU required)
+        run: python -X utf8 gpu_profile.py --selfcheck
+
       # 最终门禁：一键跑全部验证层（含 fuzz_kernels.py --quick；doc_lint 已在最前快速失败）
       - name: Verify all layers
         run: python -X utf8 verify_all.py --backend numpy

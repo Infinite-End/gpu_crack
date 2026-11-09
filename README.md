@@ -8,11 +8,11 @@
 
 | 文档属性 | 值 |
 |---|---|
-| 文档版本 | v3.4（2026-11-09） |
+| 文档版本 | v3.5（2026-11-10） |
 | 工具版本 | gpu_crack toolkit v2 |
-| 校验状态 | `python -X utf8 verify_all.py` 全绿（doc_lint 50 项 / 模块自测 13+31+23 项 / 主框架 42 项 / consistency 45/45 / fuzz 17 类 / 统一入口+示例 6/6） |
+| 校验状态 | `python -X utf8 verify_all.py` 全绿（doc_lint 50 项 / 模块自测 18+32+23 项 / 主框架 54 项 / consistency 45/45 / fuzz 17 类 / 统一入口+示例 6/6） |
 | 适用环境 | Windows + Python 3.15 + torch 2.14.1+cu130（无 torch 时自动回退 numpy） |
-| GitHub | https://github.com/Infinite-End/gpu_crack（**public / MIT**，tag `v3.4`） |
+| GitHub | https://github.com/Infinite-End/gpu_crack（**public / MIT**，tag `v3.5`） |
 | 配套文档 | [CLI_REFERENCE.md](CLI_REFERENCE.md)（**参数/输出/退出码以它为准**）、`skill/SKILL.md` 与 `skill/references/kernels.md` |
 | 许可证 | [MIT](LICENSE) |
 
@@ -104,12 +104,18 @@ skill 目录：仓库内 `skill/`（统一入口 `skill/scripts/ctf.py`、文档
 
 | 取值 | 行为 |
 |---|---|
-| `auto`（默认） | torch-CUDA → torch-CPU → numpy 依次回退 |
-| `torch` | 同上（torch 不可用时静默回退 numpy） |
-| `numpy` | 只用 numpy（慢但结果一致） |
+| `auto`（默认） | torch-CUDA → torch-CPU → numpy 依次回退；CUDA 机器上 mt19937/lfsrscan 额外启用原生加速（见下） |
+| `torch` | 同上（torch 不可用时静默回退 numpy；CUDA 时同样可能用原生加速） |
+| `numpy` | 只用 numpy（慢但结果一致；**强制关闭**一切 CUDA/原生加速路径） |
 
-- `--chunk`：每批候选数；`gpu_crack` 默认 65536、`ctf_tools` 默认 16384。
-  8 GB 显存 OOM 时把它减半（如 `--chunk 8192`）。
+- **原生 CUDA 加速（v3.5）**：`mtscan` / `lfsrscan` 在 `torch-cuda` 后端上，若 torch 安装目录自带 NVRTC，
+  会用 `ctypes` + CUDA Driver API **运行期 JIT 融合内核**（无需 nvcc/triton）：每块 1 次 kernel launch，
+  取代原先每块数千~数万次 launch（mtscan twist=1 的 launch 次数 42,493 → 9）。原生不可用或运行期失败会
+  `[warn]` 后静默回退 torch/numpy 路径（输出逐字节一致）；`GPU_CRACK_NO_NATIVE=1`（或 `CTF_NO_NATIVE=1`）
+  可静默关闭原生加速。
+- `--chunk`：每批候选数。**不传 = 自动档**（mtscan 按后端/内存自适应：原生最大 2^26、torch-cuda
+  2^18（twist=0）/2^16（twist=1）、CPU 2^16；`ctf_tools` 的 `chacha --brute` GPU 默认 262144、CPU 16384）；
+  显式传值完全尊重。8 GB 显存 OOM 时把它减半（如 `--chunk 8192`）。
 
 ## 4. 快速开始
 
@@ -218,57 +224,75 @@ python -X utf8 verify_all.py --quick --only doc,fuzz   # 快速/局部
 | 层级 | 命令 | 期望 |
 |---|---|---|
 | 1. 文档一致性 | `python -X utf8 doc_lint.py` | `DOC-LINT: ALL PASS`（参数/模块/计数/版本/矩阵与真实 CLI 对齐） |
-| 2. 模块自测 | `python -X utf8 ctf_tools.py selftest`（`ctf_ext.py` / `ctf_misc.py` 同理） | 全 PASS，退出码 0 |
-| 3. 主框架自测 | `python -X utf8 selftest.py` | 42 项断言全 PASS，退出码 0（AES-128/192/256 NIST、mt19937 双后端、mtscan/sboxscan 植入-找回、断点/JSON 契约） |
+| 2. 模块自测 | `python -X utf8 ctf_tools.py selftest`（`ctf_ext.py` / `ctf_misc.py` 同理） | 全 PASS，退出码 0（v3.5：ctf_tools 18 / ctf_ext 32 / ctf_misc 23 项断言） |
+| 3. 主框架自测 | `python -X utf8 selftest.py` | 54 项断言全 PASS，退出码 0（AES-128/192/256 NIST、mt19937 双后端、植入-找回、原生/回退对拍、断点/JSON 契约） |
 | 4. 跨实现一致性 | `python -X utf8 consistency.py` | `通过 45/45`（原有 32 条 + 新增 13 条；torch/numpy/pycryptodome/cryptography/hashlib/zlib 交叉） |
 | 5. 差分模糊测试 | `python -X utf8 fuzz_kernels.py --quick` | 17 类内核差分对拍（`--quick` 下 dual_backend 跳过，加 `--backend torch` 为 17/17；独立参考实现/第三方库） |
 | 6. 组合自测 + 示例 | `python .\skill\scripts\ctf.py selftest`；`python examples/make_examples.py --check` | 四模块全 PASS；示例命令逐条复跑通过 |
 | 附：入口/公共层自检 | `python .\skill\scripts\ctf.py selfcheck`；`python -X utf8 ctf_common.py` | 参数搬运/退出码/缓存/回退表全 PASS |
+| 附：GPU 利用率 | `python -X utf8 gpu_profile.py --selfcheck`；`--save/--compare/--inproc` | 工具自检 23/23 PASS；CLI+inproc 测量 GPU busy%/kernel 时间（v3.5 新增） |
 
 新增内核的验收标准：① 有已知向量或植入-找回；② 双后端一致；③ 参数错误走干净报错（rc=2/1，无 traceback）；
 ④ 在 `consistency.py`、`fuzz_kernels.py` 或模块 `selftest` 中留下断言。
 
 ## 9. 性能基线
 
-> 数据为 2026-11-01 本机复测（RTX 5070 Laptop 8 GB，Python 3.15，torch 2.14.1+cu130）。
-> 同一内核随驱动/温度最多相差 2~3 倍，**以 `bench` 的即时输出为准**，勿把历史数字当承诺。
+> 数据为 2026-11-10 v3.5 本机实测（RTX 5070 Laptop 8 GB，Python 3.15，torch 2.14.1+cu130）。
+> 同一内核随驱动/温度/并发最多相差 2~3 倍，**以 `bench` 的即时输出为准**，勿把历史数字当承诺。
+> 端到端 CLI 数字包含 ~2.3 s 的 Python/torch 启动地板；「计算段」数字扣除启动成本，更能反映 GPU 利用率。
 
-| 内核 | 实测 | 用法 |
+| 内核 / 用例 | v3.5 实测 | 用法 / 备注 |
 |---|---|---|
 | `popcount_matrix` | ~1000 M/s | 比特一致度打分基元 |
-| `mt19937_keys` | ~30 M 种子/s（bench，24B）；12B 稳态 ~63 M/s、3B ~294 M/s（按需截断） | 2^32 种子（24B）端到端 ≈ 3~4 分钟（20 M/s 量级） |
-| `mtscan` 端到端 | 3M 种子 8.2 M/s；10M 种子 20.5 M/s（首块 ~0.32 s CUDA 初始化对短扫描影响大） | 先 `bench` 再估时 |
-| `mt19937_keys`（numpy 后端） | 向量化后 ~2.5 M 种子/s（旧实现 ~2 K/s，约 1000×） | 无 GPU 时可用 |
-| `aes192_ecb` | ~1.6 M 块/s（AES-128/192/256 分别约 2.1/1.8/1.5 M/s） | S-box 故障枚举 |
-| `sboxscan` | 65,280 组合 ≈ 0.4~0.6 s（含全块批量验证） | 故障攻击 |
-| ChaCha20 | ~590 K keys/s（×64B） | 40 万候选 ≈ 0.7 s |
+| `mt19937_keys`（torch） | 24B ~30 M 种子/s（bench） | 库 API，`nbytes=` 按需截断 |
+| `mtscan` native（twist=0） | 计算段 **16.3 G 种子/s**（50M=3.1 ms，1 次 launch） | 旧 torch 路径 21 M/s；CLI 端到端 50M 2.44 s |
+| `mtscan` native（twist=1） | 计算段 **1.5 G 种子/s**（10M=6.8 ms） | 旧 0.49 M/s；CLI 端到端 10M **8.33×** |
+| `mtscan` torch 回退 | 12B 稳态 ~63 M/s；3B ~294 M/s | 无原生/无 CUDA 时 |
+| `mt19937_keys`（numpy） | ~2.5 M 种子/s | 无 GPU 时 |
+| `lfsrscan` native | 65536×512 拍 kernel 0.27 ms（~322×） | launch 1285→10；n>63 走位打包回退 |
+| `aes192_ecb` | ~1.6 M 块/s（AES-128/192/256 约 2.1/1.8/1.5 M/s） | S-box 故障枚举 |
+| `sboxscan` | 65,280 组合 ≈ 0.4~0.6 s（含全块验证） | 故障攻击 |
+| ChaCha20（GPU 批量） | **10.9–18.3 M keys/s**（v3.4 ~1.8 M/s） | `chacha --brute` 2M 端到端 2.06× |
+| `xorbrute`（GPU） | 3 字节/16B 扫描段 **0.28–0.30 s**（CPU 6.5–7.9 s，~22–24×） | CLI 端到端 2.52× |
+| `md5` 爆破（GPU） | **21–39 M 候选/s**（CPU hashlib 2.4–2.55 M/s，≥10×） | 有效候选 ≥2M 自动走 GPU |
 | RS63 | ~69 K 码字/s | 批量 syndrome |
 | CRC32 | ~3.4 M/s（×64B） | 匹配 |
-| xorbrute | 3 字节 / 15B 密文 ≈ 6 s | 1~3 字节爆破 |
-| `lsb` 大图 | 3000×3000 RGB ≈ 6.5 s；4000×4000 级 ≈ 14 s（8 GB 内存） | 大图先看 `stegscan` |
+| `lsb` 大图 | 3000×3000 RGB ≈ 6.5 s；4000×4000 级 ≈ 14 s | 大图先看 `stegscan` |
 
-> 性能数字为参考量级；共享 GPU / 驱动与温度会造成 ±20% 波动，**以 `bench` 即时输出为准**。
-> 短扫描（<10M 种子）的端到端吞吐被 ~0.32 s 的 CUDA 初始化摊薄，这是固有成本。
+> **GPU 利用率（`gpu_profile.py` 实测，v3.4→v3.5，同 CASES/安静窗口）**：
+> mtscan twist1 端到端 20.23→2.43 s（8.33×，净计算 17.88→0.15 s = 119×、launch 42,493→9）；
+> xorbrute 9.26→3.67 s（2.52×，净计算 4.9×）；chacha 6.03→2.94 s（2.06×，净计算 5.6×）；
+> mtscan twist0 3.45→2.44 s（1.41×，净计算 6.8×）；lfsrscan 2.78→2.42 s（1.15×，净计算 3.1×）。
+> 优化后端到端 busy% 反而下降，是因为净计算被压到 0.15 s 级、wall 被 ~2.3 s 启动地板支配——
+> **真正的计算段 GPU 基本满载**（native 内核 GPU 占比 89~100%，`netbusy%` 截断为 100）。
+> 仍为 CPU-bound：`eccscan`（单进程 CPU）、`bench`/`sboxscan`/`ksscore`（启动地板主导）。
+> 复现：`python -X utf8 gpu_profile.py --subtract-startup --repeat 2 --save after.json --compare before.json`
+> 或加 `--inproc` 看 kernel 时间/launch 数。
 
 性能设计原则（选型时遵守）：
 1. 先算廉价判据（前缀 XOR+popcount），再算完整 tag/加密；
-2. 分块执行、命中早停，显存不足自动/手动降 `--chunk`；
+2. 分块执行、命中早停，显存不足自动/手动降 `--chunk`；GPU 路径默认自动档；
 3. 常量移出批量（如 AES round key 在 CPU 算一次再广播）；
-4. 串行依赖截断（mt19937 只要前 24 个状态就只算 24 步）；
-5. 测吞吐前先预热（`bench` 已内置 3 次预热）。
+4. 串行依赖截断（mt19937 只要前 24 个状态就只算 24 步；twist=1 只 init 到 396+L）；
+5. 固定 shape 的串行链优先融合成单 kernel（原生 NVRTC），消除 launch-bound；
+6. 测吞吐前先预热（`bench` 已内置预热 + min-of-5）。
 
 ## 10. 已知限制
 
 | 限制 | 说明 |
 |---|---|
 | 无 GPU 时 | 自动 numpy 回退，结果正确但慢（mt19937 已向量化，chacha/ksscore 仍明显慢） |
-| `xorbrute` | 只支持 1~3 字节密钥；密文 <8 字节时打分不可靠；4 字节直接拒绝（内存爆炸） |
+| 原生 CUDA 加速 | 依赖 torch 安装目录里的 NVRTC dll（本机 torch 自带）；缺失/加载失败自动回退 torch/numpy 并在运行期失败时 `[warn]`；`GPU_CRACK_NO_NATIVE=1` 可静默关闭 |
+| 端到端吞吐 | CLI 启动约 2.3 s（Python+torch import）；短任务端到端被启动地板支配，批量/长扫描才体现 GPU 加速 |
+| `xorbrute` | 只支持 1~3 字节密钥；密文 <8 字节时打分不可靠；4 字节直接拒绝（内存爆炸）；GPU 路径（torch-cuda）的并列分次序已显式化为「分数降序、候选序号降序」，跨版本同分候选次序可能变化 |
 | `encode` | 只在结果含 flag 特征时返回「最终结果」；否则只打印中间候选（不硬凑） |
 | `gadgets` | 只回溯结尾指令前 32 字节窗口（含结尾指令 33~35 字节）；`f3 c3`（rep ret）等前缀结尾不单独枚举；仅 x86-64/i386，不支持 arm64 |
 | `stegscan` | JPEG 尾部用 `rfind(FFD9)`：尾部数据含 FFD9 时长度偏小、以 FFD9 结尾时**漏报**（PNG 已改为 chunk 链，无此问题）；不解析 iTXt/zTXt、不校验 PNG chunk CRC |
 | `lsb` | 16-bit **彩色/带 alpha** PNG 受 Pillow 解码限制只能看高 8 位（16-bit 灰度已完整支持）；P 模式只扫调色板索引，不扫调色板 RGB 颜色值；只扫 bit0~2 |
 | `elfinfo` | RELRO 只区分 Full（是/否）；不解析 partial RELRO 细分；Canary 用 `__stack_chk_fail` 字符串启发式 |
 | RSA 共模/广播/p-1 素数幂 | 只有库函数，不在 CLI 五连中 |
+| `md5` 爆破 GPU | 仅 torch-cuda 且有效候选 ≥2,000,000 时启用；消息长度 ≤119B（1~2 个 64B 块），超限/异常自动回退 hashlib CPU 路径 |
+| `lfsrscan` 复现性 | v3.5 重写候选状态生成后，同一 `--rng-seed` 的 best 数值与 v3.4 不同；同版本内 native/torch/numpy 三路结果一致且可复现 |
 | 平台 | 路径/命令示例按 Windows 写；Linux/macOS 上把 `python`/`\` 换成本机习惯即可 |
 
 ## 11. 目录结构
@@ -286,6 +310,7 @@ python -X utf8 verify_all.py --quick --only doc,fuzz   # 快速/局部
 ├─ consistency.py     跨实现一致性校验（45 项固定向量 + `--fuzz N` 随机对拍）
 ├─ fuzz_kernels.py    差分模糊测试（独立参考实现/第三方库，17 类内核随机对拍，`--quick` 供 CI）
 ├─ verify_all.py      一键跑全部验证层（本表所有层，CI 与交付前用）
+├─ gpu_profile.py     GPU 利用率测量/对比工具（CLI nvidia-smi 采样 + inproc torch.profiler）
 ├─ doc_lint.py        文档一致性检查（参数/模块/计数/版本/矩阵必须与真实 CLI 对齐）
 ├─ docs/bench.md      本机吞吐基准（`bench --markdown` 生成，勿手改）
 ├─ examples/          示例输入生成器 + 逐条跑法（`--check` 逐条复跑；examples/out/ 不入库）
@@ -306,6 +331,36 @@ python -X utf8 verify_all.py --quick --only doc,fuzz   # 快速/局部
 ```
 
 ## 12. 变更记录
+
+### v3.5（2026-11-10：GPU 利用率提升）
+
+> 起因：用户反馈「工具对 GPU 的使用率不够高」。基线实测（nvidia-smi 采样）除 mtscan twist=1 外
+> 多数命令 GPU busy <20%，xorbrute/md5/eccscan 完全 CPU；瓶颈根因是 **launch-bound**（每块数千~数万次
+> kernel launch）与 CPU↔GPU 往返。本轮由 4 个 owner 并行优化，verifier 独立做安静窗口 before/after。
+
+- **原生 CUDA 融合内核（gpu_crack.py）**：用 torch 自带 NVRTC + CUDA Driver API（ctypes）运行期 JIT，
+  把 mtscan（twist 0/1）与 lfsrscan 的整块扫描变成**每块 1 次 launch**：
+  - mtscan twist0 计算段 21.3 M/s → **16.3 G seeds/s**（50M=3.1 ms）；twist1 0.49 M/s → **1.5 G/s**
+    （10M=6.8 ms，launch 42,493→9；算法上免 624 步串行 twist）；
+  - lfsrscan 65536×512 拍 kernel 87 ms → **0.27 ms**（~322×）；n>63 保留位打包 CPU 回退；
+  - 原生不可用/失败自动 `[warn]` 回退 torch/numpy（输出逐字节一致）；`GPU_CRACK_NO_NATIVE=1` /
+    `CTF_NO_NATIVE=1` 可关闭。`init_backend/BACKEND/xp()/DEV` 语义未变（其它模块不受影响）。
+- **xorbrute GPU 化（ctf_tools.py）**：候选键/明文异或/整数打分/结构加分/top-k 全部在 GPU；
+  3 字节/16B 扫描段 6.5~7.9 s → **0.28~0.30 s**（~22–24×），CLI 端到端 2.52×；与 CPU 路径 top 结果逐项一致
+  （并列规则显式化为「分数降序、批内序号降序」，CPU/GPU/任意 chunk 一致）。
+- **ChaCha20 GPU 改写（ctf_tools.py）**：uint32/int32 状态（内存减半）+ 多块并行 + 设备常驻，避免 numpy 往返；
+  内核 1.8 M → **10.9–18.3 M keys/s**；`chacha --brute` 2M 从 6.54 s 降到 0.11~0.18 s（净计算），
+  GPU 默认 chunk 262144。
+- **MD5 爆破 GPU 批处理（ctf_ext.py）**：候选混合进制展开、padding、64 轮压缩全在 GPU，与 hashlib 逐项一致；
+  吞吐 2.4–2.55 M/s → **21–39 M/s**（≥10×，整空间 15.8–16.4×）；有效候选 ≥2M 且 torch-cuda 时自动启用，
+  异常/超限/`--backend numpy` 回退 CPU（输出/退出码/枚举顺序不变）。
+- **可观测性**：新增 `gpu_profile.py`（nvidia-smi CLI 采样 + `--subtract-startup` 扣启动地板 + 背景负载校正
+  + `--inproc` torch.profiler 统计 kernel 时间/launch/GPU 占比 + `--save/--compare`）；`bench --profile`
+  逐内核输出 GPU 时间/launch 占比，bench 计时改为预热 + min-of-5。
+- **验证**：selftest.py 42→54 项；ctf_tools selftest 13→18、ctf_ext 31→32；doc_lint 50 项、consistency 45/45、
+  fuzz 17 类全绿；verifier 独立抽查 native/回退/numpy 多方对拍逐字节一致。
+- **语义/行为变化（P3，已文档化）**：`--chunk` 默认改自动档；lfsrscan 同 seed 数值与 v3.4 不同（同版本可复现）；
+  xorbrute 同分候选次序确定化；md5 阈值 2M；md5/xorbrute/chacha 端到端仍受 ~2.3 s 启动地板限制。
 
 ### v3.4（2026-11-09：skill.zip 独立安装包）
 
@@ -434,7 +489,7 @@ python -X utf8 verify_all.py --quick --only doc,fuzz   # 快速/局部
 
 ## 13. GitHub 仓库与跨机使用
 
-- 仓库：https://github.com/Infinite-End/gpu_crack （**public / 开源**），标签 `v3.4`。
+- 仓库：https://github.com/Infinite-End/gpu_crack （**public / 开源**），标签 `v3.5`。
 - 仓库根目录 = 本目录。`skill/` 是 skill 定义（`SKILL.md` / `SKILL.en.md` / `references/kernels.md` / `scripts/ctf.py` / `agents/openai.yaml`）的**同步副本**；
   修改 skill 源后需同步到 `skill/`，`doc_lint.py` 会校验镜像一致性。
 - 在其它机器/其它模型上使用：

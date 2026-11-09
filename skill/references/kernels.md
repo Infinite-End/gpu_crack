@@ -2,11 +2,11 @@
 
 | 文档属性 | 值 |
 |---|---|
-| 文档版本 | v3.4（2026-11-09） |
+| 文档版本 | v3.5（2026-11-10） |
 | 定位 | **选型速查**：题型 → 内核 → 验证向量 → 吞吐。完整参数/输出/退出码以仓库根 `CLI_REFERENCE.md` 为准 |
 | 环境 | 仓库根目录；解释器 PATH 上的 `python3`/`python`（需 torch 2.14.1+cu130 才有 GPU，否则自动回落 numpy） |
 | 性能口径 | RTX 5070 Laptop 8 GB 本机复测；随驱动/温度波动 2~3 倍，先跑 `bench` |
-| 验证入口 | 改代码后跑 `python -X utf8 verify_all.py`（六层：doc_lint / 模块自测 / 主框架自测 / consistency / fuzz_kernels / 统一入口+示例） |
+| 验证入口 | 改代码后跑 `python -X utf8 verify_all.py`（六层：doc_lint / 模块自测 / 主框架自测 / consistency / fuzz_kernels / 统一入口+示例）；GPU 内核改动用 `gpu_profile.py --inproc` 看 kernel 时间/launch 数 |
 
 ## 1. 题型 → 内核 决策表
 
@@ -45,21 +45,21 @@
 
 | 内核 | 用途 | 关键输入 | 验证向量 | 吞吐（本机） |
 |---|---|---|---|---|
-| `mt19937_keys` / `mtscan` | 种子 → 24B 密钥 | 24B 目标 hex；`--twist`；库 API `nbytes=` 按需截断 | 纯 Python MT 参考（twist 0/1） | ~30 M 种子/s（bench，24B）；12B ~62 M/s；mtscan 端到端 3M 8.2 M/s / 10M 20.5 M/s |
+| `mt19937_keys` / `mtscan` | 种子 → 24B 密钥（v3.5 原生融合内核） | 24B 目标 hex；`--twist`；`nbytes=` | 纯 Python MT 参考（twist 0/1）+ native/回退对拍 | native 计算段 16.3 G/s（twist0）、1.5 G/s（twist1）；CLI 50M 2.44 s |
 | `aes192_ecb` / `sboxscan` | 批量 AES-192 单块 / 故障枚举 | 明文/密文/24B key | NIST AES-192 向量 | ~1.6 M 块/s；65,280 组合 ≈ 0.4 s |
 | `popcount_matrix` / `ksscore` | 比特一致度 | 目标密钥流 | 与逐位 popcount 参考一致 | ~900 M/s |
 | `bit_agreement` | 候选 vs 目标打分 | `[N,L]` 候选 | torch == numpy | 随 GPU |
-| `lfsrscan` | 多 LFSR 并行 | `taps`、`bits` | 双后端同 `--rng-seed` 结果一致 | 视状态数 |
+| `lfsrscan` | 多 LFSR 并行（v3.5 位打包/native） | `taps`、`bits` | native/回退/numpy 一致；同版本 `--rng-seed` 可复现 | 65536×512 拍 kernel 0.27 ms |
 
 ## 3. `ctf_tools.py` 内核
 
 | 内核 | 用途 | 验证向量 | 吞吐（×64B） |
 |---|---|---|---|
-| `chacha20_keystream` / `chacha` | ChaCha20 密钥流、候选扫描 | RFC 8439 §2.4.2；pycryptodome 原版变体 | ~590 K keys/s |
+| `chacha20_keystream` / `chacha` | ChaCha20 密钥流、候选扫描（v3.5 GPU 设备常驻） | RFC 8439 §2.4.2；pycryptodome 原版变体 | 10.9–18.3 M keys/s（旧 1.8 M/s） |
 | `poly1305` / `poly1305_tag` | Poly1305、AEAD tag | RFC 8439 §2.5.2 / §2.8.2；cryptography AEAD | 标量（过滤后终验） |
 | `rs63_syndromes` / `rs63_check` / `rs63` | RS(63,31) 校验与纠错 | 自建编码器零 syndrome + 单字节定位 | ~69 K 码字/s |
 | `crc32_batch` / `crc32` | CRC32 / 尾部爆破 | zlib（含随机 97B） | ~3.4 M/s |
-| `xorbrute` | 1~3 字节 XOR 爆破 | 经典 cryptopals 向量 + `flag{...}` 向量 | 3 字节/15B ≈ 6 s |
+| `xorbrute` | 1~3 字节 XOR 爆破（v3.5 GPU） | 经典 cryptopals 向量 + `flag{...}` 向量；CPU/GPU top 逐项一致 | 3 字节/16B 扫描 0.28–0.30 s（旧 6.5–7.9 s） |
 | `aesctr_keystream` / `aesctr` | AES-192-CTR | NIST SP800-38A F.5.3 | 随 GPU |
 
 ## 4. `ctf_ext.py` 内核

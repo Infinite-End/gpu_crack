@@ -45,6 +45,7 @@ gpu_crack.py — 通用 GPU 批量爆破 / 校验框架（CTF toolkit 主框架�
 from __future__ import annotations
 
 import argparse
+import ctypes
 import os
 import sys
 import time
@@ -121,6 +122,387 @@ def parse_hex(text, opt):
         return bytes.fromhex(text)
     except ValueError:
         return None
+
+
+# ---------------------------------------------------------------- 原生 CUDA 内核（NVRTC JIT）
+# 目标：把"每块上千次小 kernel launch"变成"每块 1 次融合 kernel"，从根上解决 launch-bound。
+# 实现：ctypes 直接调 torch 自带的 NVRTC（编译 CUDA C） + CUDA Driver API（加载/发射/拷贝）。
+#       原生层自身只依赖 numpy/ctypes（不 import torch）；`--backend`/`init_backend`/`xp()`/`DEV`
+#       语义完全不变 —— 它只是 cmd_mtscan/cmd_lfsrscan 在 torch-cuda 后端上的内部加速器。
+# 失败/缺失时 _NV 置 False，命令自动回退到 torch/numpy 路径，功能与退出码不变。
+_NV = None                 # None=尚未尝试；False=不可用；_NvCuda=可用
+_NV_TRIED = False
+_NV_ERR = ''               # 最近一次失败原因（报告/排障用）
+_NV_DISABLE = bool(os.environ.get('GPU_CRACK_NO_NATIVE', '') or os.environ.get('CTF_NO_NATIVE', ''))
+_NV_MAX_HITS = 1 << 20     # 单块命中缓冲上限（短目标如 1 字节时命中很多）
+_P = ctypes.c_void_p
+
+
+class _NvFail(RuntimeError):
+    """原生内核运行期失败：命令层捕获后静默回退 torch/numpy 路径。"""
+
+_NV_SRC = rb'''
+typedef unsigned int u32;
+typedef unsigned long long u64;
+
+__device__ __forceinline__ u32 mt_temper(u32 y) {
+    y ^= y >> 11;
+    y ^= (y << 7) & 0x9D2C5680u;
+    y ^= (y << 15) & 0xEFC60000u;
+    y ^= y >> 18;
+    return y;
+}
+
+/* modded mt19937: init_genrand then temper the first L states (no twist). */
+extern "C" __global__ void mt_scan_t0(u64 seed0, u32 count, int L,
+                                      const unsigned char* __restrict__ tgt,
+                                      u32* __restrict__ hit_count,
+                                      u64* __restrict__ hit_seeds,
+                                      u32 max_hits)
+{
+    u32 tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= count) return;
+    u32 st[24];
+    u32 v = (u32)(seed0 + (u64)tid);
+    st[0] = v;
+    for (int i = 1; i < L; ++i) {
+        v = 1812433253u * (v ^ (v >> 30)) + (u32)i;
+        st[i] = v;
+    }
+    unsigned int ok = 1u;
+    for (int i = 0; i < L; ++i) {
+        u32 y = mt_temper(st[i]);
+        if ((unsigned char)(y & 0xFFu) != tgt[i]) { ok = 0u; break; }
+    }
+    if (ok) {
+        u32 idx = atomicAdd(hit_count, 1u);
+        if (idx < max_hits) hit_seeds[idx] = seed0 + (u64)tid;
+    }
+}
+
+/* standard std::mt19937: only the first L twisted states are needed.
+ * twist step i uses old_st[i], old_st[i+1], old_st[i+397]; for i < L the indices
+ * (i+1, i+397) are both > i, i.e. never overwritten yet by the in-place twist.
+ * So init up to index 396+L and save {0..L} U {397..396+L} (2L+1 words) and the
+ * first L twisted outputs can be computed directly - 624 sequential steps avoided. */
+extern "C" __global__ void mt_scan_t1(u64 seed0, u32 count, int L,
+                                      const unsigned char* __restrict__ tgt,
+                                      u32* __restrict__ hit_count,
+                                      u64* __restrict__ hit_seeds,
+                                      u32 max_hits)
+{
+    u32 tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= count) return;
+    u32 saved[49];
+    int ns = 0;
+    u32 v = (u32)(seed0 + (u64)tid);
+    int maxidx = 396 + L;
+    saved[ns++] = v;                          /* old st[0] */
+    for (int i = 1; i <= maxidx; ++i) {
+        v = 1812433253u * (v ^ (v >> 30)) + (u32)i;
+        if (i <= L) saved[ns++] = v;         /* old st[1..L] */
+        else if (i >= 397) saved[ns++] = v;  /* old st[397..396+L] */
+    }
+    unsigned int ok = 1u;
+    for (int i = 0; i < L; ++i) {
+        u32 a = saved[i], b = saved[i + 1], c = saved[L + 1 + i];
+        u32 yv = (a & 0x80000000u) | (b & 0x7FFFFFFFu);
+        u32 key = c ^ (yv >> 1) ^ ((yv & 1u) * 0x9908B0DFu);
+        key = mt_temper(key);
+        if ((unsigned char)(key & 0xFFu) != tgt[i]) { ok = 0u; break; }
+    }
+    if (ok) {
+        u32 idx = atomicAdd(hit_count, 1u);
+        if (idx < max_hits) hit_seeds[idx] = seed0 + (u64)tid;
+    }
+}
+
+/* bit-packed Fibonacci LFSR: one u64 per trial (bit j = state bit j).
+ * fb = parity(state & tapmask); state <<= 1 | fb (shifted-out high bits never
+ * feed back, so no mask is needed as long as n <= 63). */
+extern "C" __global__ void lfsr_scan(const u64* __restrict__ init, u64 tapmask, u32 count,
+                                     int Tlen, const unsigned char* __restrict__ tgt,
+                                     u64* __restrict__ best)
+{
+    u32 tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= count) return;
+    u64 st = init[tid];
+    u64 sc = 0;
+    for (int k = 0; k < Tlen; ++k) {
+        u64 fb = __popcll(st & tapmask) & 1ull;
+        sc += (fb == (u64)tgt[k]);
+        st = (st << 1) | fb;
+    }
+    atomicMax(best, sc);
+}
+'''
+
+_NV_KERNELS = ('mt_scan_t0', 'mt_scan_t1', 'lfsr_scan')
+
+
+class _NvCuda(object):
+    """NVRTC + CUDA Driver API 的最小封装（ctypes；不依赖 torch 导入）。"""
+
+    def __init__(self):
+        import glob
+        import importlib.util
+        spec = importlib.util.find_spec('torch')
+        if spec is None or not spec.origin:
+            raise RuntimeError('未找到 torch 安装，无法定位 NVRTC')
+        libdir = os.path.join(os.path.dirname(spec.origin), 'lib')
+        win = sys.platform.startswith('win')
+        if win:
+            load = ctypes.WinDLL
+            driver_name = 'nvcuda.dll'
+            nvrtc_pat, builtin_pat = 'nvrtc64_*.dll', 'nvrtc-builtins64_*.dll'
+        else:
+            load = ctypes.CDLL
+            driver_name = 'libcuda.so.1'
+            nvrtc_pat, builtin_pat = 'libnvrtc.so*', 'libnvrtc-builtins.so*'
+
+        def pick(pattern, exclude=()):
+            cands = [p for p in glob.glob(os.path.join(libdir, pattern))
+                     if not any(x in os.path.basename(p).lower() for x in exclude)]
+            if not cands:
+                raise RuntimeError('缺少 %s（torch/lib 下未找到）' % pattern)
+            return sorted(cands)[-1]
+
+        nvrtc_path = pick(nvrtc_pat, exclude=('.alt',))
+        builtin_path = pick(builtin_pat)
+        try:                                   # nvrtc 运行期会按名字加载 builtins，先显式载入
+            self._builtin = load(builtin_path)
+        except OSError:
+            self._builtin = None
+        self._nvrtc = load(nvrtc_path)
+        self._cuda = load(driver_name)
+        self._init_api()
+        self._nvrtc.nvrtcCreateProgram.argtypes = [ctypes.POINTER(_P), ctypes.c_char_p,
+                                                   ctypes.c_char_p, ctypes.c_int, _P, _P]
+        self._nvrtc.nvrtcCreateProgram.restype = ctypes.c_int
+        self._nvrtc.nvrtcCompileProgram.argtypes = [_P, ctypes.c_int, ctypes.POINTER(ctypes.c_char_p)]
+        self._nvrtc.nvrtcCompileProgram.restype = ctypes.c_int
+        for fn, args in (('nvrtcGetPTXSize', [ _P, ctypes.POINTER(ctypes.c_size_t)]),
+                         ('nvrtcGetPTX', [_P, ctypes.c_char_p]),
+                         ('nvrtcGetProgramLogSize', [_P, ctypes.POINTER(ctypes.c_size_t)]),
+                         ('nvrtcGetProgramLog', [_P, ctypes.c_char_p])):
+            getattr(self._nvrtc, fn).argtypes = args
+            getattr(self._nvrtc, fn).restype = ctypes.c_int
+
+        self._chk(self._cuda.cuInit(0), 'cuInit')
+        dev = ctypes.c_int()
+        self._chk(self._cuda.cuDeviceGet(ctypes.byref(dev), 0), 'cuDeviceGet')
+        maj, mnr = ctypes.c_int(), ctypes.c_int()
+        self._cuda.cuDeviceGetAttribute(ctypes.byref(maj), 75, dev)
+        self._cuda.cuDeviceGetAttribute(ctypes.byref(mnr), 76, dev)
+        self.arch = 'compute_%d%d' % (maj.value, mnr.value)
+        # 用 primary context（与 torch/numpy 共用同一 CUDA 上下文，避免双 context 冲突）
+        self._ctx = _P()
+        self._chk(self._cuda.cuDevicePrimaryCtxRetain(ctypes.byref(self._ctx), dev),
+                  'cuDevicePrimaryCtxRetain')
+        self._chk(self._cuda.cuCtxSetCurrent(self._ctx), 'cuCtxSetCurrent')
+        ptx = self._compile(_NV_SRC)
+        self._module = _P()
+        self._chk(self._cuda.cuModuleLoadData(ctypes.byref(self._module),
+                                              ctypes.cast(ptx, _P)), 'cuModuleLoadData')
+        self._funcs = {}
+        for name in _NV_KERNELS:
+            f = _P()
+            self._chk(self._cuda.cuModuleGetFunction(ctypes.byref(f), self._module, name.encode()),
+                      'cuModuleGetFunction(%s)' % name)
+            self._funcs[name] = f
+        self._d = {}
+        self._alloc('tgt', 64)
+        self._alloc('cnt', 4)
+        self._alloc('best', 8)
+        self._alloc('hits', _NV_MAX_HITS * 8)
+        self._init_cap = 0
+        self._tbits_cap = 0
+
+    # ---- ctypes / driver 基础
+    def _init_api(self):
+        c = self._cuda
+        def proto(name, argtypes, restype=ctypes.c_int):
+            fn = getattr(c, name)
+            fn.argtypes = argtypes
+            fn.restype = restype
+        proto('cuDeviceGet', [ctypes.POINTER(ctypes.c_int), ctypes.c_int])
+        proto('cuDeviceGetAttribute', [ctypes.POINTER(ctypes.c_int), ctypes.c_int, ctypes.c_int])
+        proto('cuDevicePrimaryCtxRetain', [ctypes.POINTER(_P), ctypes.c_int])
+        proto('cuCtxSetCurrent', [_P])
+        proto('cuCtxSynchronize', [])
+        proto('cuModuleLoadData', [ctypes.POINTER(_P), _P])
+        proto('cuModuleGetFunction', [ctypes.POINTER(_P), _P, ctypes.c_char_p])
+        alloc = getattr(c, 'cuMemAlloc_v2', c.cuMemAlloc)
+        alloc.argtypes = [ctypes.POINTER(_P), ctypes.c_size_t]
+        alloc.restype = ctypes.c_int
+        self._alloc_fn = alloc
+        free = getattr(c, 'cuMemFree_v2', None)
+        if free is not None:
+            free.argtypes = [_P]
+        h2d = getattr(c, 'cuMemcpyHtoD_v2', c.cuMemcpyHtoD)
+        h2d.argtypes = [_P, _P, ctypes.c_size_t]
+        h2d.restype = ctypes.c_int
+        self._h2d_fn = h2d
+        d2h = getattr(c, 'cuMemcpyDtoH_v2', c.cuMemcpyDtoH)
+        d2h.argtypes = [_P, _P, ctypes.c_size_t]
+        d2h.restype = ctypes.c_int
+        self._d2h_fn = d2h
+        memset = getattr(c, 'cuMemsetD8_v2', c.cuMemsetD8)
+        memset.argtypes = [_P, ctypes.c_ubyte, ctypes.c_size_t]
+        memset.restype = ctypes.c_int
+        self._memset_fn = memset
+        launch = c.cuLaunchKernel
+        launch.argtypes = [_P, ctypes.c_uint, ctypes.c_uint, ctypes.c_uint,
+                           ctypes.c_uint, ctypes.c_uint, ctypes.c_uint, ctypes.c_uint,
+                           _P, ctypes.POINTER(_P), ctypes.POINTER(_P)]
+        launch.restype = ctypes.c_int
+        self._launch_fn = launch
+
+    @staticmethod
+    def _chk(rc, what):
+        if rc != 0:
+            raise RuntimeError('CUDA driver 调用失败 %s: rc=%d' % (what, rc))
+
+    def _compile(self, src):
+        prog = _P()
+        self._chk(self._nvrtc.nvrtcCreateProgram(ctypes.byref(prog), src, b'gpu_crack_kernels.cu',
+                                                 0, None, None), 'nvrtcCreateProgram')
+        opts = ['--gpu-architecture=' + self.arch, '-default-device']
+        arr = (ctypes.c_char_p * len(opts))(*[o.encode() for o in opts])
+        rc = self._nvrtc.nvrtcCompileProgram(prog, len(opts), arr)
+        sz = ctypes.c_size_t()
+        self._nvrtc.nvrtcGetProgramLogSize(prog, ctypes.byref(sz))
+        log = ctypes.create_string_buffer(sz.value or 1)
+        self._nvrtc.nvrtcGetProgramLog(prog, log)
+        if rc != 0:
+            raise RuntimeError('NVRTC 编译失败: ' + log.value.decode(errors='replace')[:1500])
+        sz = ctypes.c_size_t()
+        self._chk(self._nvrtc.nvrtcGetPTXSize(prog, ctypes.byref(sz)), 'nvrtcGetPTXSize')
+        ptx = ctypes.create_string_buffer(sz.value)
+        self._chk(self._nvrtc.nvrtcGetPTX(prog, ptx), 'nvrtcGetPTX')
+        return ptx
+
+    def _alloc(self, key, nbytes):
+        p = _P()
+        self._chk(self._alloc_fn(ctypes.byref(p), max(1, int(nbytes))), 'cuMemAlloc(%s)' % key)
+        self._d[key] = p
+        return p
+
+    def _upload(self, arr):
+        arr = np.ascontiguousarray(arr)
+        return arr, ctypes.c_void_p(arr.ctypes.data), int(arr.nbytes)
+
+    def _h2d(self, dev, arr):
+        arr, ptr, n = self._upload(arr)
+        if n:
+            self._chk(self._h2d_fn(dev, ptr, n), 'cuMemcpyHtoD')
+        return arr
+
+    def _d2h(self, host_arr, dev, nbytes):
+        host_arr = np.ascontiguousarray(host_arr)
+        self._chk(self._d2h_fn(ctypes.c_void_p(host_arr.ctypes.data), dev, int(nbytes)),
+                  'cuMemcpyDtoH')
+        return host_arr
+
+    def _launch(self, name, count, block, arg_objs):
+        args = (_P * len(arg_objs))()
+        for i, obj in enumerate(arg_objs):
+            args[i] = ctypes.cast(obj, _P)
+        grid = (int(count) + block - 1) // block
+        self._chk(self._launch_fn(self._funcs[name], grid, 1, 1, block, 1, 1, 0, None, args, None),
+                  'cuLaunchKernel(%s)' % name)
+
+    def sync(self):
+        self._chk(self._cuda.cuCtxSynchronize(), 'cuCtxSynchronize')
+
+    # ---- 业务入口
+    def mt_scan(self, start, count, L, twist, tgt):
+        """扫描 [start, start+count) 种子，返回 (升序命中种子列表, 内核报告命中数)。
+
+        命中数超过 _NV_MAX_HITS 时列表会被截断（reported 仍为真实数，调用方负责告警）。
+        """
+        count = int(count)
+        if count <= 0:
+            return [], 0
+        self._memset_fn(self._d['cnt'], 0, 4)
+        self._h2d(self._d['tgt'], np.frombuffer(bytes(tgt), dtype=np.uint8).copy())
+        seed0 = ctypes.c_uint64(int(start) & 0xFFFFFFFFFFFFFFFF)
+        cnt = ctypes.c_uint32(count)
+        Lc = ctypes.c_int(int(L))
+        maxh = ctypes.c_uint32(_NV_MAX_HITS)
+        self._launch('mt_scan_t1' if twist else 'mt_scan_t0', count, 256,
+                     [ctypes.byref(seed0), ctypes.byref(cnt), ctypes.byref(Lc),
+                      ctypes.byref(self._d['tgt']), ctypes.byref(self._d['cnt']),
+                      ctypes.byref(self._d['hits']), ctypes.byref(maxh)])
+        self.sync()
+        cnt_host = np.zeros(1, dtype=np.uint32)
+        self._d2h(cnt_host, self._d['cnt'], 4)
+        nhit = int(cnt_host[0])
+        k = min(nhit, _NV_MAX_HITS)
+        out = np.zeros(k, dtype=np.uint64)
+        if k:
+            self._d2h(out, self._d['hits'], k * 8)
+        hits = []
+        for v in out.tolist():
+            hits.append(int(v) if v < (1 << 63) else int(v) - (1 << 64))
+        hits.sort()
+        return hits, nhit
+
+    def lfsr_scan(self, states, n, taps, tgt_bits):
+        """states: u64 数组（每 trial 一个打包状态）；返回最佳一致位数。"""
+        states = np.ascontiguousarray(states, dtype=np.uint64)
+        count = int(states.size)
+        if count == 0:
+            return 0
+        tapmask = 0
+        for t in taps:
+            tapmask |= 1 << (int(t) - 1)
+        if count * 8 > self._init_cap:
+            cap = max(count * 8, self._init_cap * 2, 1 << 20)
+            self._alloc('init', cap)
+            self._init_cap = cap
+        self._h2d(self._d['init'], states)
+        tgt = np.ascontiguousarray(np.asarray(tgt_bits), dtype=np.uint8)
+        if tgt.size > self._tbits_cap:
+            cap = max(int(tgt.size), self._tbits_cap * 2, 4096)
+            self._alloc('tbits', cap)
+            self._tbits_cap = cap
+        self._h2d(self._d['tbits'], tgt)
+        self._memset_fn(self._d['best'], 0, 8)
+        tapmask_c = ctypes.c_uint64(tapmask)
+        cnt = ctypes.c_uint32(count)
+        tlen = ctypes.c_int(int(tgt.size))
+        self._launch('lfsr_scan', count, 256,
+                     [ctypes.byref(self._d['init']), ctypes.byref(tapmask_c), ctypes.byref(cnt),
+                      ctypes.byref(tlen), ctypes.byref(self._d['tbits']),
+                      ctypes.byref(self._d['best'])])
+        self.sync()
+        best_host = np.zeros(1, dtype=np.uint64)
+        self._d2h(best_host, self._d['best'], 8)
+        return int(best_host[0])
+
+
+def _nv_available():
+    """懒初始化原生 CUDA 层；不可用（无 GPU/无 NVRTC/禁用）返回 False，绝不抛异常。"""
+    global _NV, _NV_TRIED, _NV_ERR
+    if _NV_TRIED:
+        return _NV is not None and _NV is not False
+    _NV_TRIED = True
+    if _NV_DISABLE:
+        _NV, _NV_ERR = False, 'GPU_CRACK_NO_NATIVE 已设置'
+        return False
+    try:
+        _NV = _NvCuda()
+        return True
+    except Exception as exc:                 # noqa: BLE001 - 任何失败都只回退，不影响功能
+        _NV = False
+        _NV_ERR = '%s: %s' % (type(exc).__name__, exc)
+        return False
+
+
+def _native_enabled():
+    """原生内核只在 torch-cuda 后端上作为加速器启用（不改 BACKEND/xp()/DEV 语义）。"""
+    return BACKEND == "torch-cuda" and _nv_available()
 
 
 # ---------------------------------------------------------------- 通用工具
@@ -479,10 +861,117 @@ def _bench_json_objs(rows):
             for label, rate, unit, cnt, sec in rows]
 
 
+class _MuteStderrFd(object):
+    """临时把 C 层 stderr(fd=2) 指到 devnull —— libkineto 在 Windows 上会朝 stderr
+    打 "USDT: ... profiler_start/stop" 日志，--profile 时不应污染用户终端。"""
+
+    def __init__(self, fd=2):
+        self._fd = fd
+        self._saved = None
+        self._null = None
+
+    def __enter__(self):
+        try:
+            sys.stderr.flush()
+            self._null = os.open(os.devnull, os.O_WRONLY)
+            self._saved = os.dup(self._fd)
+            os.dup2(self._null, self._fd)
+        except OSError:                        # 非文件描述符环境（如 IDE 捕获）：放弃抑制
+            self._saved = None
+        return self
+
+    def __exit__(self, *exc_info):
+        if self._saved is not None:
+            try:
+                os.dup2(self._saved, self._fd)
+            finally:
+                for f in (self._saved, self._null):
+                    try:
+                        os.close(f)
+                    except OSError:
+                        pass
+                self._saved = self._null = None
+        return False
+
+
+def _impl_profile(fn, iters, count):
+    """对单个内核做一次 CUDA 计时：返回 {gpu_s, launches, wall_s}（每次调用的累计量）。"""
+    for _ in range(2):                       # 预热：JIT/缓存分配/首次 kernel 加载
+        fn()
+    _cuda_sync()
+    iters = max(1, int(iters))
+    prof = None
+    if BACKEND == "torch-cuda":
+        try:
+            prof = torch.profiler.profile(
+                activities=[torch.profiler.ProfilerActivity.CUDA])
+        except Exception:                    # noqa: BLE001 - 无 kineto 时退回事件计时
+            prof = None
+    if prof is not None:
+        try:
+            t0 = time.perf_counter()
+            with _MuteStderrFd():
+                with prof:
+                    for _ in range(iters):
+                        fn()
+                    _cuda_sync()
+            wall = time.perf_counter() - t0
+            gpu_s = 0.0
+            launches = 0
+            for ev in prof.key_averages():
+                dt = float(getattr(ev, 'self_device_time_total', 0.0) or 0.0)   # 微秒
+                if dt > 0:
+                    gpu_s += dt * 1e-6
+                    launches += int(ev.count)
+            return {'gpu_s': gpu_s / iters, 'launches': launches / iters,
+                    'wall_s': wall / iters, 'count': count}
+        except Exception:                    # noqa: BLE001
+            pass
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    t0 = time.perf_counter()
+    start.record()
+    for _ in range(iters):
+        fn()
+    end.record()
+    torch.cuda.synchronize()
+    wall = time.perf_counter() - t0
+    return {'gpu_s': start.elapsed_time(end) / 1e3 / iters, 'launches': float(iters),
+            'wall_s': wall / iters, 'count': count}
+
+
+def _bench_profile_objs(specs):
+    """--profile：对每个内核返回一条带 GPU 时间/launch 数/占比的事件对象。
+
+    wall 用"不挂 profiler 的预热后多次取最小"单独测量（profiler 自身开销很大，
+    若拿带 profiler 的 wall 当分母，GPU 占比会被严重低估）。
+    """
+    out = []
+    for label, fn, iters, count in specs:
+        for _ in range(2):
+            fn()
+        _cuda_sync()
+        best = float('inf')
+        for _ in range(3):
+            t0 = time.perf_counter()
+            fn()
+            _cuda_sync()
+            best = min(best, time.perf_counter() - t0)
+        r = _impl_profile(fn, iters, count)
+        ratio = (r['gpu_s'] / best) if best > 0 else 0.0
+        out.append({'event': 'profile', 'kernel': label,
+                    'launches_per_call': round(r['launches'], 3),
+                    'gpu_ms_per_call': round(r['gpu_s'] * 1e3, 4),
+                    'wall_ms_per_call': round(best * 1e3, 4),
+                    'gpu_ratio': round(min(ratio, 1.0), 4), 'count': count})
+    return out
+
+
 def cmd_bench(a):
     T = xp()
     md = bool(getattr(a, 'markdown', False))
     js = C.json_mode()
+    profiling = bool(getattr(a, 'profile', False))
     # 横幅属于提示：--markdown 时 stdout 只留 Markdown 表格，--json 时只留 JSON 行
     text_out = not (md or js or C.quiet())
     if text_out:
@@ -500,11 +989,15 @@ def cmd_bench(a):
     rows = []
 
     def _timed(fn, *args):
+        """预热后多次取最小 —— 避免"短 kernel 被首次启动/缓存抖动放大"的统计口径问题。"""
         warm(fn, *args)
-        t0 = time.time()
-        fn(*args)
-        _cuda_sync()
-        return time.time() - t0
+        best = float('inf')
+        for _ in range(5):
+            t0 = time.perf_counter()
+            fn(*args)
+            _cuda_sync()
+            best = min(best, time.perf_counter() - t0)
+        return best
 
     # 1) popcount 吞吐
     n = 1 << 22
@@ -539,6 +1032,72 @@ def cmd_bench(a):
         for line in _bench_text_lines(rows, md):
             print(line)
 
+    if not profiling:
+        return
+    if BACKEND != "torch-cuda":
+        C.info(f"[profile] 当前后端 {BACKEND} 不支持 profiler（需 torch-cuda）")
+        return
+    # --profile：GPU 时间 / launch 次数 / 占 wall 比例，便于用户自查"GPU 利用率"由什么构成
+    specs = []
+    if BACKEND.startswith("torch"):
+        specs.append(('popcount', lambda: popcount_matrix(x), 10, f'{n} 个 32bit'))
+        specs.append(('mt19937', lambda: mt19937_keys(s, False), 20, f'{m} 个种子'))
+        specs.append(('aes192', lambda: aes_ecb(blk, k, None, ai, ai), 10,
+                      f'{blk.shape[0]} 块'))
+    if _native_enabled():
+        far = bytes(range(24))
+        specs.append(('native_mt_t0', lambda: _NV.mt_scan(0, 50_000_000, 24, False, far),
+                      10, '50M 个种子'))
+        specs.append(('native_mt_t1', lambda: _NV.mt_scan(0, 10_000_000, 24, True, far),
+                      5, '10M 个种子'))
+        st_lfsr = _lfsr_gen_packed(np.random.default_rng(1), 1 << 16, 25)
+        tbits = np.zeros(512, dtype=np.int64)
+        specs.append(('native_lfsr', lambda: _NV.lfsr_scan(st_lfsr, 25, [10, 11, 24], tbits),
+                      20, '65536 trials x512 拍'))
+    if not specs:
+        C.info(f"[profile] 当前后端 {BACKEND} 不支持 profiler（需 torch-cuda）")
+        return
+    try:
+        objs = _bench_profile_objs(specs)
+    except Exception as exc:                 # noqa: BLE001 - profiler 不可用不影响 bench 主输出
+        C.info(f"[profile] profiler 不可用：{exc}")
+        return
+    if js:
+        for obj in objs:
+            C.emit(obj)
+    else:
+        for o in objs:
+            print(f"[profile] {o['kernel']:<12} {o['launches_per_call']:>6.2f} 次 launch/次  "
+                  f"GPU {o['gpu_ms_per_call']:>8.3f} ms/次  "
+                  f"wall {o['wall_ms_per_call']:>8.3f} ms/次  "
+                  f"GPU 占比 {o['gpu_ratio']*100:5.1f}%  ({o['count']})")
+
+
+def _chunk_explicit(a):
+    """用户是否显式给了 --chunk（用于 auto-chunk：默认值 65536 表示"自动档"）。
+
+    兼容进程内调用方（直接构造 Namespace/对象并设置 .chunk）：只要 .chunk 存在且不等于
+    默认值 65536，就视为用户显式指定，完全尊重。
+    """
+    if getattr(a, '_chunk_explicit', False):
+        return True
+    c = getattr(a, 'chunk', None)
+    try:
+        return c is not None and int(c) != (1 << 16)
+    except (TypeError, ValueError):
+        return False
+
+
+def _native_mt_chunk(total):
+    """原生融合内核的单块上限（命中数远小于 2^20，故可一次扫很多种子）。"""
+    return max(1, min(int(total), 1 << 26))
+
+
+def _torch_mt_chunk(total, twist):
+    """torch 回退路径的 auto-chunk：按实测最优档位（twist=1 的 [N,624] 内存大，取小档）。"""
+    base = (1 << 16) if twist else (1 << 18)
+    return max(1, min(int(total), base))
+
 
 def cmd_mtscan(a):
     """暴力 mt19937 种子 → 24B 密钥，比对目标。"""
@@ -554,6 +1113,15 @@ def cmd_mtscan(a):
     if a.seed_start < -(2 ** 63) or a.seed_start + a.seed_count > 2 ** 63 - 1:
         return C.fail("--seed-start/--seed-count 超出 int64 可表示范围")
     twist = (a.twist == 1)
+    # 原生融合内核（默认加速器）：整块种子扫描 = 1 次 kernel launch，彻底去掉 launch-bound。
+    # 失败/不可用/显存不足一律回退到 torch/numpy 路径，结果语义不变。
+    native = _native_enabled()
+    if native:
+        try:                                   # 预检：极小规模试跑，失败立即回退
+            _NV.mt_scan(a.seed_start, min(2, a.seed_count), L, twist, target)
+        except Exception as exc:               # noqa: BLE001
+            C.info(f"[warn] 原生 CUDA 内核不可用，回退 torch/numpy 路径：{exc}")
+            native = False
     tgt_t = (T.tensor(list(target), dtype=T.uint8, device=DEV) if BACKEND.startswith("torch")
              else np.frombuffer(target, dtype=np.uint8))
 
@@ -564,7 +1132,7 @@ def cmd_mtscan(a):
         return np.asarray(from_dev(mt19937_keys(seeds, twist=twist, nbytes=L)[0]),
                           dtype=np.uint8)
 
-    def _step(lo, hi):
+    def _torch_step(lo, hi):
         cnt = hi - lo
         seeds = (T.arange(lo, hi, dtype=T.int64, device=DEV) if BACKEND.startswith("torch")
                  else np.arange(lo, hi, dtype=np.int64))
@@ -575,13 +1143,44 @@ def cmd_mtscan(a):
             out = [int(lo) + int(i) for i in hit_indices(eq)]
         return cnt, out
 
-    total, found, dt = C.chunked(_step, a.seed_count, start=a.seed_start, chunk=a.chunk,
-                                 label='mtscan', checkpoint=getattr(a, 'checkpoint', ''),
-                                 reset=getattr(a, 'reset_checkpoint', False),
-                                 progress=not getattr(a, 'no_progress', False),
-                                 ckpt_meta={'kind': 'mtscan', 'key_hex': target.hex(),
-                                            'twist': int(a.twist)},
-                                 on_hit=lambda h: True)
+    def _auto_chunk():
+        if _chunk_explicit(a):
+            # 安全上限：单块命中缓冲 2^20 条；L=1 时命中率 ~1/256，2^27 种子仍安全
+            return max(1, min(int(a.chunk), 1 << 27))
+        if native:
+            return _native_mt_chunk(a.seed_count)
+        if BACKEND == "torch-cuda":
+            return _torch_mt_chunk(a.seed_count, twist)
+        return 1 << 16
+
+    truncated = [False]
+
+    def _native_step(lo, hi):
+        try:
+            hits, reported = _NV.mt_scan(lo, hi - lo, L, twist, target)
+        except Exception as exc:               # noqa: BLE001 - 运行期失败 -> 回退
+            raise _NvFail(str(exc))
+        if reported > len(hits) and not truncated[0]:
+            truncated[0] = True
+            C.info(f"[warn] 单块命中 {reported} 条超过回传上限 {len(hits)}，仅保留前 "
+                   f"{len(hits)} 条（可加长 --key-hex 或减小 --chunk）")
+        return hi - lo, hits
+
+    while True:
+        _step = _native_step if native else _torch_step
+        try:
+            total, found, dt = C.chunked(_step, a.seed_count, start=a.seed_start,
+                                         chunk=_auto_chunk(), label='mtscan',
+                                         checkpoint=getattr(a, 'checkpoint', ''),
+                                         reset=getattr(a, 'reset_checkpoint', False),
+                                         progress=not getattr(a, 'no_progress', False),
+                                         ckpt_meta={'kind': 'mtscan', 'key_hex': target.hex(),
+                                                    'twist': int(a.twist)},
+                                         on_hit=lambda h: True)
+            break
+        except _NvFail as exc:                  # 原生内核运行期异常：静默回退后重跑
+            C.info(f"[warn] 原生 CUDA 内核运行失败，回退 torch/numpy 路径：{exc}")
+            native = False
     C.info(f"[done] {total:,} 个种子 / {dt:.2f}s = {total/max(dt,1e-9)/1e6:.1f} M seeds/s")
     # 断点里可能残留其它任务/其它目标的历史命中：只承认与当前目标真正一致的种子
     verified, stale = [], 0
@@ -754,12 +1353,76 @@ def cmd_ksscore(a):
             'text': f"  最佳比特一致度 {best['score']}/{L*8}   候选 {best['cand']}"})
 
 
+def _lfsr_gen_packed(rng, count, n):
+    """单次整数抽样生成均匀随机的 n 位初始状态（n<=63；跨后端逐位一致，可复现）。"""
+    return np.ascontiguousarray(rng.integers(0, 1 << int(n), size=int(count), dtype=np.uint64))
+
+
+def _lfsr_packed_best(states, taps, tbits):
+    """位打包回退实现（torch 或 numpy）：每 trial 一个整数，逐拍 parity+移位，返回最佳一致位数。"""
+    shifts = [int(t) - 1 for t in taps]
+    total = int(states.size)
+    if total == 0:
+        return 0
+    tb = np.asarray(tbits, dtype=np.int64)
+    Tlen = int(tb.size)
+    if BACKEND.startswith("torch"):
+        st = torch.as_tensor(states, dtype=torch.int64, device=DEV)
+        score = torch.zeros(total, dtype=torch.int64, device=DEV)
+        tb_t = torch.as_tensor(tb, device=DEV)
+        for k in range(Tlen):
+            fb = st >> shifts[0]
+            for s in shifts[1:]:
+                fb = fb ^ (st >> s)
+            fb = fb & 1
+            score.add_(fb ^ tb_t[k])           # 先累加"不一致位数"，最后换成一致位数
+            st.mul_(2)                         # 等价于 <<1（int64 回绕语义一致）
+            st.bitwise_or_(fb)
+        mism = int(score.min().item())
+        return Tlen - mism
+    st = np.asarray(states, dtype=np.uint64).copy()
+    score = np.zeros(total, dtype=np.int64)
+    for k in range(Tlen):
+        fb = st >> np.uint64(shifts[0])
+        for s in shifts[1:]:
+            fb ^= st >> np.uint64(s)
+        fb &= np.uint64(1)
+        score += (fb != np.uint64(int(tb[k]))).astype(np.int64)
+        st = (st << np.uint64(1)) | fb
+    return Tlen - int(score.min())
+
+
+def _lfsr_bits_best(rng, trials, n, taps, tbits):
+    """n>63 的兼容路径（逐 bit 状态矩阵，保留旧实现语义）。"""
+    state = rng.integers(0, 2, size=(trials, n), dtype=np.int64)
+    taps_i = [t - 1 for t in taps]
+    Tlen = int(np.size(tbits))
+    if BACKEND.startswith("torch"):
+        st = torch.tensor(state, device=DEV)
+        score = torch.zeros(trials, dtype=torch.int64, device=DEV)
+        for k in range(Tlen):
+            fb = st[:, taps_i[0]].clone()
+            for t in taps_i[1:]:
+                fb ^= st[:, t]
+            score += (fb == int(tbits[k])).to(torch.int64)
+            st = torch.cat([fb.unsqueeze(1), st[:, :-1]], dim=1)
+        return int(score.max().item())
+    st = state.copy()
+    score = np.zeros(trials, dtype=np.int64)
+    for k in range(Tlen):
+        fb = st[:, taps_i[0]].copy()
+        for t in taps_i[1:]:
+            fb ^= st[:, t]
+        score += (fb == int(tbits[k]))
+        st = np.concatenate([fb[:, None], st[:, :-1]], axis=1)
+    return int(score.max())
+
+
 def cmd_lfsrscan(a):
     """
     并行跑多条 Fibonacci LFSR，匹配目标比特流。
     --taps  "25:10,11,24" 或 "25:10,11,24;28:12,22,25;27:1,4,19,21,23"（多组）
     """
-    T = xp()
     if not a.bits or set(a.bits) - set("01"):
         return C.fail("--bits 只能是 0/1 组成的非空比特串")
     target_bits = np.array([int(c) for c in a.bits], dtype=np.int64)
@@ -789,36 +1452,43 @@ def cmd_lfsrscan(a):
     trials = a.trials
     best = -1
     t0 = time.time()
+    # 原生融合内核：n<=63 时可把所有 trial 压到 u64 位打包，整组 1 次 kernel launch。
+    native = _native_enabled() and all(n <= 63 for n, _t in groups)
+    if native:
+        try:
+            n0, taps0 = groups[0]
+            _NV.lfsr_scan(np.zeros(4, dtype=np.uint64), n0, taps0, target_bits)
+        except Exception as exc:               # noqa: BLE001
+            C.info(f"[warn] 原生 CUDA 内核不可用，回退 torch/numpy 路径：{exc}")
+            native = False
+    chunk = getattr(a, 'chunk', 1 << 16)
+    if not _chunk_explicit(a):
+        chunk = min(trials, (1 << 22) if native else (1 << 20))
+    else:
+        chunk = max(1, min(int(chunk), 1 << 24))   # 安全上限：1M 状态/8MB 设备缓冲 ×16
+    chunk = max(1, int(chunk))
+
     for g in range(len(groups)):
         n, taps = groups[g]
+        m = -1
         try:
-            state = rng.integers(0, 2, size=(trials, n), dtype=np.int64)
-        except (MemoryError, ValueError) as exc:
-            return C.fail(f"初始状态内存不足（trials={trials}, n={n}）：{exc}")
-        try:
-            if BACKEND.startswith("torch"):
-                st = torch.tensor(state, device=DEV)
-                taps_t = torch.tensor([t - 1 for t in taps], device=DEV)
-                score = torch.zeros(trials, dtype=torch.int64, device=DEV)
-                # 逐拍累加一致位数（不再保留 [trials, 拍数] 大矩阵，长比特流也不爆内存）
-                for k in range(Tlen):
-                    fb = st[:, taps_t[0]].clone()
-                    for t in taps_t[1:]:
-                        fb ^= st[:, t]
-                    score += (fb == target_bits[k]).to(torch.int64)
-                    st = torch.cat([fb.unsqueeze(1), st[:, :-1]], dim=1)
-                m = int(score.max().item())
+            if n > 63:                          # 兼容路径（逐 bit 状态矩阵）
+                m = _lfsr_bits_best(rng, trials, n, taps, target_bits)
             else:
-                st = state.copy()
-                taps_i = [t - 1 for t in taps]
-                score = np.zeros(trials, dtype=np.int64)
-                for k in range(Tlen):
-                    fb = st[:, taps_i[0]].copy()
-                    for t in taps_i[1:]:
-                        fb ^= st[:, t]
-                    score += (fb == target_bits[k])
-                    st = np.concatenate([fb[:, None], st[:, :-1]], axis=1)
-                m = int(score.max())
+                for lo in range(0, trials, chunk):
+                    cnt = min(chunk, trials - lo)
+                    states = _lfsr_gen_packed(rng, cnt, n)
+                    if native:
+                        try:
+                            cur = _NV.lfsr_scan(states, n, taps, target_bits)
+                        except Exception as exc:   # noqa: BLE001 - 运行期失败回退
+                            C.info(f"[warn] 原生 CUDA 内核运行失败，回退 torch/numpy 路径：{exc}")
+                            native = False
+                            cur = _lfsr_packed_best(states, taps, target_bits)
+                    else:
+                        cur = _lfsr_packed_best(states, taps, target_bits)
+                    if cur > m:
+                        m = cur
         except MemoryError as exc:
             return C.fail(f"内存/显存不足（trials={trials}, n={n}, bits={Tlen}）：{exc}")
         except RuntimeError as exc:
@@ -837,11 +1507,20 @@ def cmd_lfsrscan(a):
 # ---------------------------------------------------------------- CLI
 # 全局参数（7 个）的唯一定义；主解析器和各子命令解析器都注册一遍，
 # 子命令后的副本用 SUPPRESS 默认值，这样"全局参数写在子命令前后都行"。
+class _ChunkAction(argparse.Action):
+    """记录 --chunk 是否被显式给出（默认值 = 自动档，显式给出则完全尊重用户值）。"""
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        setattr(namespace, self.dest, values)
+        setattr(namespace, '_chunk_explicit', True)
+
+
 _GLOBAL_SPECS = (
     (('--backend',), dict(default='auto', choices=['auto', 'torch', 'numpy'],
                           help='计算后端：auto=torch-cuda→torch-cpu→numpy（默认 auto；子命令前后均可）')),
-    (('--chunk',), dict(type=int, default=1 << 16,
-                        help='每批候选数（默认 65536；显存不足时自动减半；子命令前后均可）')),
+    (('--chunk',), dict(type=int, default=1 << 16, action=_ChunkAction,
+                        help='每批候选数（默认 65536=自动档：mtscan 按后端/内核自动选 256K~64M；'
+                             '显式给出时完全尊重该值；显存不足时自动减半；子命令前后均可）')),
     (('--json',), dict(action='store_true', default=False,
                        help='结果行改为单行 JSON（机器可读；子命令前后均可）')),
     (('--quiet',), dict(action='store_true', default=False,
@@ -876,6 +1555,9 @@ def main(argv=None):
     _add_global_args(p, after_sub=True)
     p.add_argument("--markdown", action="store_true",
                    help="输出 Markdown 表格（可直接写入 docs/bench.md；stdout 只留表格）")
+    p.add_argument("--profile", action="store_true",
+                   help="额外逐内核输出 GPU 时间 / launch 次数 / 占 wall 比例（诊断 GPU 利用率；"
+                        "stdout 追加 [profile] 行，--json 时追加 event=profile 对象）")
 
     p = sub.add_parser("mtscan", help="暴力 mt19937 种子 -> 24B 密钥，与目标比对")
     _add_global_args(p, after_sub=True)

@@ -74,6 +74,7 @@ TOOLKIT_FILES = (
     'fuzz_kernels.py',
     'verify_all.py',
     'doc_lint.py',
+    'gpu_profile.py',
     # 文档与依赖
     'README.md',
     'CLI_REFERENCE.md',
