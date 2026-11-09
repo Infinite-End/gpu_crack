@@ -7,10 +7,10 @@ description: GPU-accelerated, command-line CTF toolkit in this repository for ba
 
 | 文档属性 | 值 |
 |---|---|
-| 文档版本 | v2.1（2026-11-01） |
+| 文档版本 | v2.2（2026-11-09） |
 | 适用工具 | gpu_crack toolkit v2（仓库根目录） |
 | 校验状态 | `ctf.py selftest` 全 PASS；`consistency.py` 32/32 |
-| 配套文档 | `CLI_REFERENCE.md`（仓库根，规范性参数/输出/退出码）、`README.md`（仓库根）、`references/kernels.md` |
+| 配套文档 | `CLI_REFERENCE.md`（仓库根，规范性参数/输出/退出码）、`README.md`（仓库根）、`references/kernels.md`、`SKILL.en.md`（英文精简版） |
 
 本 skill 是**可被任意模型复用**的操作规范。所有事实以仓库文档为准，不要凭记忆猜参数：
 命令行细节查仓库根的 `CLI_REFERENCE.md`，项目说明查 `README.md`。
@@ -19,7 +19,7 @@ description: GPU-accelerated, command-line CTF toolkit in this repository for ba
 
 | 项 | 值 |
 |---|---|
-| 工具箱目录 | 仓库根目录（`ctf.py` 向上两级；可用 `CTF_TOOLKIT_DIR` 覆盖） |
+| 工具箱目录 | `CTF_TOOLKIT_DIR`（有效时）→ 从 `scripts/ctf.py` 向上查找 `gpu_crack.py` → 向上两级；skill 目录被单独拷出仓库时须设 `CTF_TOOLKIT_DIR` |
 | GPU 解释器 | PATH 上的 `python3` / `python`（需 torch + CUDA；也可用 `CTF_PYTHON` 强制指定） |
 | 解释器覆盖 | 环境变量 `CTF_PYTHON`（设置且存在时优先） |
 | 统一入口 | `scripts/ctf.py`（本 skill 内） |

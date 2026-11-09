@@ -1,0 +1,4 @@
+interface:
+  display_name: "CTF Toolkit"
+  short_description: "GPU batch brute-force and triage for CTF challenges"
+  default_prompt: "Use $ctf-toolkit to triage this CTF challenge and run the right batched kernel."

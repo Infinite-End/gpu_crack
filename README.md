@@ -8,11 +8,11 @@
 
 | 文档属性 | 值 |
 |---|---|
-| 文档版本 | v2.1（2026-11-01） |
+| 文档版本 | v2.2（2026-11-09） |
 | 工具版本 | gpu_crack toolkit v2 |
-| 校验状态 | `ctf.py selftest` 全 PASS；`consistency.py` 32/32；文档驱动验收 129/129 |
+| 校验状态 | `ctf.py selftest` 全 PASS；`consistency.py` 32/32；`doc_lint.py` 文档一致性 35 项全 PASS |
 | 适用环境 | Windows + Python 3.15 + torch 2.14.1+cu130（无 torch 时自动回退 numpy） |
-| GitHub | https://github.com/Infinite-End/gpu_crack（**public / MIT**，tag `v2.1`） |
+| GitHub | https://github.com/Infinite-End/gpu_crack（**public / MIT**，tag `v2.2`） |
 | 配套文档 | [CLI_REFERENCE.md](CLI_REFERENCE.md)（**参数/输出/退出码以它为准**）、`skill/SKILL.md` 与 `skill/references/kernels.md` |
 | 许可证 | [MIT](LICENSE) |
 
@@ -67,17 +67,22 @@ pip install torch   # 可选：GPU 加速；CUDA 版安装命令见 https://pyto
 
 ### 3.2 解释器选择算法（`ctf.py`）
 
-按顺序取第一个可用者：
+候选解释器按下列顺序产出（全部自动发现，代码内**不含任何硬编码本机路径**）：
 
-1. 环境变量 `CTF_PYTHON` 指向的解释器（只要文件存在即用，哪怕没有 CUDA）；
-2. PATH 上的 `python3` / `python`（探测 `import torch; torch.cuda.is_available()`）；
-3. 运行 `ctf.py` 的当前解释器。
+1. 环境变量 `CTF_PYTHON` —— **强制采纳**，只校验文件存在，不检查 CUDA；
+2. 运行 `ctf.py` 的当前解释器 `sys.executable`；
+3. PATH 上的 `python3`；
+4. PATH 上的 `python`；
+5. Windows `py -0p` 登记的每个版本；
+6. 工具箱目录内的 `.venv` / `venv`。
+
+除第 1 步外，逐个用 `python -c "import torch;assert torch.cuda.is_available()"` 探测，**取第一个通过者**；全都不通过时回退到当前解释器（GPU 内核自动走 `--backend numpy` 慢路径），不会报错退出。
 
 ### 3.3 路径解析与环境变量
 
 | 变量 | 默认值 | 作用 |
 |---|---|---|
-| `CTF_TOOLKIT_DIR` | 仓库根目录（`ctf.py` 向上两级） | 工具箱目录（`ctf.py` 找模块脚本用） |
+| `CTF_TOOLKIT_DIR` | 自动探测：有效时优先，否则从 `ctf.py` 向上查找 `gpu_crack.py`，再退到向上两级 | 工具箱目录（`ctf.py` 找模块脚本用）；skill 目录被单独拷出仓库时须设为仓库根 |
 | `CTF_PYTHON` | 见 3.2 | 强制指定解释器 |
 
 skill 目录：仓库内 `skill/`（统一入口 `skill/scripts/ctf.py`、文档 `skill/SKILL.md`、`skill/references/kernels.md`）。
@@ -247,13 +252,27 @@ ct = G.aes192_ecb(blocks, key_t, None, a_idx, b_val)          # blocks/key_t/a_i
 ├─ CLI_REFERENCE.md   完整 CLI 参考（参数/输出/退出码/示例）
 ├─ requirements.txt    依赖清单（pip install -r requirements.txt）
 ├─ .gitignore / .gitattributes
-└─ skill/             DSH skill 定义同步副本（GitHub 版）
-   ├─ SKILL.md
+└─ skill/             skill 定义同步副本（GitHub 版；Codex / DSH 可直接注册本目录）
+   ├─ SKILL.md         中文完整版（文档一致性检查的对象）
+   ├─ SKILL.en.md      英文精简版（对外/英文模型用，与 SKILL.md 同步维护）
    ├─ references/kernels.md
-   └─ scripts/ctf.py
+   ├─ agents/openai.yaml   Codex skill 元数据（display_name / short_description / default_prompt）
+   └─ scripts/ctf.py    统一入口
 ```
 
 ## 12. 变更记录
+
+### v2.2（2026-11-09，本轮：skill 部署化 + 可移植性）
+
+- `skill/scripts/ctf.py`：
+  - 非交互（管道/重定向）时强制 stdout/stderr 为 UTF-8，修复 harness/Codex 按 UTF-8 解码时的中文乱码；
+  - 工具箱目录改为「`CTF_TOOLKIT_DIR`（校验有效）→ 从脚本位置向上查找 `gpu_crack.py` → 向上两级」，
+    skill 目录嵌在仓库任意层级均可自洽，不再依赖外部环境变量；
+  - 找不到 `gpu_crack.py` 时一次性明确报错并返回 2，不再静默输出四段空自测。
+- `skill/SKILL.en.md`：新增英文精简版 skill 说明（面向英文模型 / 对外分发）。
+- `skill/agents/openai.yaml`：新增 Codex skill 元数据。
+- 文档版本统一到 v2.2（`README.md` / `CLI_REFERENCE.md` / `SKILL.md` / `kernels.md` 原先分别停在 v2.1 与 v1.0）。
+- `doc_lint.py`：版本校验接受 v2.2。
 
 ### v2.1（2026-11-01，本轮：自测 + 修复 + 文档规范化）
 
@@ -273,11 +292,12 @@ ct = G.aes192_ecb(blocks, key_t, None, a_idx, b_val)          # blocks/key_t/a_i
 
 ## 13. GitHub 仓库与跨机使用
 
-- 仓库：https://github.com/Infinite-End/gpu_crack （**public / 开源**），标签 `v2.1`。
-- 仓库根目录 = 本目录。`skill/` 是 DSH skill 定义（`SKILL.md` / `references/kernels.md` / `scripts/ctf.py`）的**同步副本**；
+- 仓库：https://github.com/Infinite-End/gpu_crack （**public / 开源**），标签 `v2.2`。
+- 仓库根目录 = 本目录。`skill/` 是 skill 定义（`SKILL.md` / `SKILL.en.md` / `references/kernels.md` / `scripts/ctf.py` / `agents/openai.yaml`）的**同步副本**；
   修改 skill 源后需同步到 `skill/`，`doc_lint.py` 会校验镜像一致性。
 - 在其它机器/其它模型上使用：
-  1. `git clone` 后**无需任何路径配置**——`ctf.py` 以自身位置向上两级定位仓库根（`CTF_TOOLKIT_DIR` 仅用于覆盖）；
+  1. `git clone` 后**无需任何路径配置**——`ctf.py` 先从 `CTF_TOOLKIT_DIR` 取工具箱目录，未设置时从脚本位置向上查找 `gpu_crack.py`；
+     仅当 `skill/` 被**单独拷贝到仓库之外**（如 `~/.codex/skills/ctf-toolkit`）时，才需要把 `CTF_TOOLKIT_DIR` 指向仓库根；
   2. **解释器自动发现**：`CTF_PYTHON` → 当前解释器 → PATH 上的 `python3`/`python` → Windows `py -0p` 登记的各版本 → 仓库内 `.venv`/`venv`，取第一个 `torch.cuda.is_available()` 为真的；全都不行则回落当前解释器走 numpy 后端；
   3. 跑 `python -X utf8 doc_lint.py`（有 repo 内 `skill/` 时自动用镜像）与 `python -X utf8 consistency.py` 确认环境。
 

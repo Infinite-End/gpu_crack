@@ -2,7 +2,7 @@
 
 | 文档属性 | 值 |
 |---|---|
-| 文档版本 | v1.0（2026-11-01） |
+| 文档版本 | v2.2（2026-11-09） |
 | 适用工具 | gpu_crack toolkit v2（仓库根目录） |
 | 校验状态 | 与 `--help` 和各模块自测一致；验收套件 129/129 PASS |
 | 配套文档 | [README.md](README.md)（项目说明）、skill 的 `SKILL.md` / `references/kernels.md`（使用策略） |

@@ -144,7 +144,7 @@ for p in DOCS + [os.path.join(ROOT, f) for f in SCRIPTS] + [CTF]:
 
 # ---------- 7. 关键章节 ----------
 for p, text in doc_text.items():
-    check('has version header: ' + os.path.basename(p), ('v2.1' in text) or ('v1.0' in text))
+    check('has version header: ' + os.path.basename(p), ('v2.2' in text) or ('v2.1' in text) or ('v1.0' in text))
 for token in ('退出码矩阵', '稳定契约', '★', 'UTF-8'):
     check('CLI_REFERENCE contains ' + token, token in cli_ref)
 check('CLI_REFERENCE count 26', '26 个功能子命令' in cli_ref)

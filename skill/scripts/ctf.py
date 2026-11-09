@@ -38,10 +38,58 @@ import shutil
 import subprocess
 import sys
 
-# 仓库根目录 = 本文件向上两级（skill/scripts/ctf.py -> skill -> 仓库根）；可用 CTF_TOOLKIT_DIR 覆盖
+# ---- 输出编码 ----
+# 被管道/重定向时（harness、Codex、subprocess.call）强制 UTF-8，保证调用方按 UTF-8 解码不会乱码；
+# 交互式终端仍沿用系统默认编码（Windows 控制台 cp936 存中文更友好）。
+def _force_utf8_stdio() -> None:
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            if stream is not None and not stream.isatty():
+                stream.reconfigure(encoding='utf-8', errors='replace')
+        except Exception:
+            pass
+
+
+_force_utf8_stdio()
+
+# 仓库根目录 = 自动探测（见 _locate_toolkit）；脱离仓库单独部署时请设 CTF_TOOLKIT_DIR
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _DEFAULT_TOOLKIT = os.path.dirname(os.path.dirname(_HERE))
-TOOLKIT = os.environ.get('CTF_TOOLKIT_DIR') or _DEFAULT_TOOLKIT
+MARKER = 'gpu_crack.py'
+
+
+def _locate_toolkit() -> str:
+    """确定工具箱目录：CTF_TOOLKIT_DIR（有效时）-> 从本文件向上寻找 gpu_crack.py -> 向上两级。
+
+    向上查找让 skill 目录嵌在仓库任意层级都能自洽（本地 skill/ 副本、skills/<name>/ 布局都适用）；
+    仅当 skill 目录被单独拷到仓库之外时，才需要显式设置 CTF_TOOLKIT_DIR。
+    """
+    env = os.environ.get('CTF_TOOLKIT_DIR', '').strip()
+    if env:
+        if os.path.isfile(os.path.join(env, MARKER)):
+            return os.path.abspath(env)
+        print(f'[提示] CTF_TOOLKIT_DIR={env} 下没有 {MARKER}，忽略该变量并自动探测', file=sys.stderr)
+    d = _HERE
+    for _ in range(8):
+        if os.path.isfile(os.path.join(d, MARKER)):
+            return d
+        parent = os.path.dirname(d)
+        if parent == d:
+            break
+        d = parent
+    return _DEFAULT_TOOLKIT
+
+
+TOOLKIT = _locate_toolkit()
+
+
+def _toolkit_ready() -> bool:
+    """工具箱目录里必须能找到 gpu_crack.py，否则一次性报清楚，而不是静默跑出四段空输出。"""
+    if os.path.isfile(os.path.join(TOOLKIT, MARKER)):
+        return True
+    print(f'[错误] 工具箱目录 {TOOLKIT} 中找不到 {MARKER}；'
+          f'请设置环境变量 CTF_TOOLKIT_DIR 指向仓库根目录', file=sys.stderr)
+    return False
 
 # module -> script
 SCRIPTS = {
@@ -118,6 +166,11 @@ def pick_python() -> str:
     """
     key = os.environ.get('CTF_PYTHON', '')
     if key in _PICKED:
+        return _PICKED[key]
+    forced = key.strip()
+    if forced and os.path.isfile(forced):
+        # 显式指定即强制采纳：不问 CUDA，GPU 内核可退回 numpy 后端
+        _PICKED[key] = os.path.abspath(forced)
         return _PICKED[key]
     for p in _candidate_interpreters():
         try:
@@ -220,6 +273,8 @@ def main() -> int:
     mod, rest = argv[0], argv[1:]
 
     if mod in ('selftest', 'test', 'all'):
+        if not _toolkit_ready():
+            return 2
         rc = 0
         for script, args in (('gpu_crack.py', ['bench']),
                              ('ctf_tools.py', ['selftest']),
@@ -237,6 +292,8 @@ def main() -> int:
 
     if mod not in SCRIPTS:
         print(f'[错误] 未知模块 {mod}；可用: {", ".join(sorted(SCRIPTS))}', file=sys.stderr)
+        return 2
+    if not _toolkit_ready():
         return 2
     gl, rest = split_globals(rest)
     g_ok, dropped = filter_globals(gl_front + gl, GLOBALS_OF[SCRIPTS[mod]])
