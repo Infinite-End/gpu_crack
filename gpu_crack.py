@@ -19,10 +19,11 @@ gpu_crack.py — 通用 GPU 批量爆破 / 校验框架（CTF toolkit 主框架�
   ksscore    候选密钥流 × 多样本 的比特一致度打分（统计淘汰）
   lfsrscan   多条 LFSR（抽头可不同）并行跑 N 拍，匹配目标比特流
 
-全局参数（必须写在子命令之前）
-------------------------------
+全局参数（写在子命令之前或之后均可）
+------------------------------------
   --backend {auto,torch,numpy}   默认 auto（torch-cuda → torch-cpu → numpy 回退）
   --chunk N                      每批候选数，默认 65536；显存不足时减半
+  --json / --quiet / --no-progress / --checkpoint FILE / --reset-checkpoint
 
 退出码
 ------
@@ -98,9 +99,28 @@ def from_dev(a):
     return np.asarray(a)
 
 
+def hit_indices(mask):
+    """bool 命中掩码 -> int 索引数组。
+
+    注意 torch 的 tensor.nonzero() 返回 [K, 1]（与 numpy 的 tuple-of-arrays 不同），
+    旧代码 mask.nonzero()[0] 在 torch 后端只会取到"第一个命中"，导致每块漏报其余命中。
+    """
+    return np.nonzero(np.asarray(from_dev(mask)))[0]
+
+
 def M32():
     """uint32 掩码张量（torch 用 int64 模拟 uint32 回绕）。"""
     return 0xFFFFFFFF
+
+
+def parse_hex(text, opt):
+    """解析命令行裸 hex 参数；非法时返回 None（调用方转成退出码 2，不抛 traceback）。"""
+    if not isinstance(text, str):
+        return None
+    try:
+        return bytes.fromhex(text)
+    except ValueError:
+        return None
 
 
 # ---------------------------------------------------------------- 通用工具
@@ -135,7 +155,7 @@ def popcount_matrix(x):
         return c
     x = np.asarray(x).astype(np.uint64)
     tab = _pctab(np)
-    c = tab[x & 0xFF].astype(np.uint16)
+    c = tab[x & 0xFF]
     for s in (8, 16, 24, 32, 40, 48, 56):
         c = c + tab[(x >> s) & 0xFF]
     return c
@@ -155,6 +175,8 @@ def bit_agreement(cand_bytes, target_bytes):
         if t.dim() == 1:
             x = c ^ t.unsqueeze(0)
             return (8 * c.shape[1]) - popcount_matrix(x).sum(-1)
+        if c.shape[0] == 0:                              # 空候选：避免 torch.cat([]) 报错
+            return torch.zeros((0, t.shape[0]), dtype=torch.int64, device=c.device)
         # [N,L] vs [M,L] -> 分块避免 N*M 爆显存
         outs = []
         step = max(1, 2 ** 26 // max(1, t.shape[0] * c.shape[1]))
@@ -174,21 +196,24 @@ def bit_agreement(cand_bytes, target_bytes):
 
 
 # ---------------------------------------------------------------- MT19937
-def mt19937_keys(seeds, twist=True):
+def mt19937_keys(seeds, twist=True, nbytes=24):
     """
-    给定种子批量生成 std::mt19937 的前 24 个输出低字节（= AES-192 密钥）。
-    seeds : [N] int64 张量
-    返回  : [N, 24] uint8
-    说明  : twist=False 对应"直接读 init_genrand 后的状态数组并 temper"
-            （本次 cryp-12025 的二进制就是这种写法）
+    给定种子批量生成 std::mt19937 的前 nbytes 个输出低字节（默认 24B = AES-192 密钥）。
+    seeds  : [N] 整型张量/数组（种子按 uint32 取模，负数等价于 2^32 - |seed| 附近回绕）
+    twist  : False=init_genrand 后直接 temper 初始状态（魔改版常见）；
+             True=标准 std::mt19937（取数前先 twist）
+    nbytes : 需要的密钥字节数 1~24；只取前几字节时按需截断，不做无用功
+    返回   : [N, nbytes] uint8
     """
     T = xp()
     mask = M32()
-    N = seeds.shape[0]
+    n = int(nbytes)
+    if not 1 <= n <= 24:
+        raise ValueError(f'nbytes 需在 1..24，收到 {n}')
     if BACKEND.startswith("torch"):
         s = seeds.to(torch.int64) & mask
-        need = 24
-        rows = 624 if twist else need          # 不 twist 时只需前 24 个状态（串行依赖）
+        N = s.shape[0]
+        rows = 624 if twist else n          # 不 twist 时只需前 n 个状态（串行依赖）
         st = torch.empty((N, rows), dtype=torch.int64, device=DEV)
         st[:, 0] = s
         for i in range(1, rows):
@@ -200,38 +225,41 @@ def mt19937_keys(seeds, twist=True):
                 v = st[:, (i + 397) % 624] ^ (y >> 1)
                 v = torch.where((y & 1) == 1, v ^ 0x9908B0DF, v)
                 st[:, i] = v & mask
-        out = st[:, :24]
-        y = out.clone()
+        y = st[:, :n].clone()
         y ^= y >> 11
         y ^= (y << 7) & 0x9D2C5680
         y ^= (y << 15) & 0xEFC60000
         y ^= y >> 18
         y &= mask
         return (y & 0xFF).to(torch.uint8)
-    # numpy 版（慢，仅兜底）
-    res = np.empty((N, 24), dtype=np.uint8)
-    M = np.uint64(0xFFFFFFFF)
-    for i, sd in enumerate(seeds):
-        stn = np.zeros(624, dtype=np.uint64)
-        stn[0] = np.uint64(int(sd)) & M
-        for k in range(1, 624):
-            prev = stn[k - 1]
-            stn[k] = (np.uint64(1812433253) * (prev ^ (prev >> np.uint64(30))) + np.uint64(k)) & M
-        if twist:
-            for k in range(624):
-                y = (stn[k] & np.uint64(0x80000000)) + (stn[(k + 1) % 624] & np.uint64(0x7FFFFFFF))
-                v = stn[(k + 397) % 624] ^ (y >> np.uint64(1))
-                if y & np.uint64(1):
-                    v = v ^ np.uint64(0x9908B0DF)
-                stn[k] = v & M
-        for k in range(24):
-            y = stn[k]
-            y ^= y >> np.uint64(11)
-            y ^= (y << np.uint64(7)) & np.uint64(0x9D2C5680)
-            y ^= (y << np.uint64(15)) & np.uint64(0xEFC60000)
-            y ^= y >> np.uint64(18)
-            res[i, k] = np.uint8(y & np.uint64(0xFF))
-    return res
+
+    # numpy 版：跨种子向量化（旧版逐种子纯 Python 循环，慢 ~1000 倍）+ 行优先布局
+    s = np.asarray(seeds)
+    if s.ndim != 1:
+        raise ValueError('seeds 需为 1D 整型数组')
+    u = s.astype(np.uint64) & np.uint64(mask)     # int64 -> uint64 走补码回绕，语义同 torch
+    N = u.shape[0]
+    rows = 624 if twist else n
+    st = np.empty((rows, N), dtype=np.uint64)
+    st[0] = u
+    for i in range(1, rows):
+        prev = st[i - 1]
+        st[i] = (np.uint64(1812433253) *
+                 (prev ^ (prev >> np.uint64(30))) + np.uint64(i)) & np.uint64(mask)
+    if twist:
+        for i in range(624):
+            y = (st[i] & np.uint64(0x80000000)) + (st[(i + 1) % 624] & np.uint64(0x7FFFFFFF))
+            v = st[(i + 397) % 624] ^ (y >> np.uint64(1))
+            v = v ^ np.where((y & np.uint64(1)) == np.uint64(1),
+                             np.uint64(0x9908B0DF), np.uint64(0))
+            st[i] = v & np.uint64(mask)
+    y = st[:n].copy()
+    y ^= y >> np.uint64(11)
+    y ^= (y << np.uint64(7)) & np.uint64(0x9D2C5680)
+    y ^= (y << np.uint64(15)) & np.uint64(0xEFC60000)
+    y ^= y >> np.uint64(18)
+    y &= np.uint64(mask)
+    return (y & np.uint64(0xFF)).astype(np.uint8).T.copy()
 
 
 # ---------------------------------------------------------------- AES-192
@@ -320,10 +348,21 @@ def aes_ecb(block, key, sbox_table=None, a_idx=None, b_val=None):
     if Nk not in (4, 6, 8):
         raise ValueError(f'AES 密钥需 16/24/32 字节，收到 {klen} 字节')
     Nr = Nk + 6
+    # S-box 表统一转成后端原生 256 项 uint8 表（允许调用方传 numpy 表/torch CPU 表）
     if sbox_table is None:
-        sbox_table = T.from_numpy(SBOX) if is_t else SBOX
+        sbox_table = torch.from_numpy(SBOX).to(DEV) if is_t else SBOX
     if is_t:
-        sbox_table = sbox_table.to(DEV) if hasattr(sbox_table, "to") else sbox_table
+        if isinstance(sbox_table, np.ndarray):
+            sbox_table = torch.from_numpy(
+                np.ascontiguousarray(sbox_table, dtype=np.uint8)).to(DEV)
+        else:
+            sbox_table = sbox_table.to(device=DEV, dtype=torch.uint8)
+        if int(sbox_table.numel()) != 256:
+            raise ValueError(f'sbox_table 需为 256 项，收到 {int(sbox_table.numel())} 项')
+    else:
+        sbox_table = np.asarray(sbox_table, dtype=np.uint8)
+        if sbox_table.size != 256:
+            raise ValueError(f'sbox_table 需为 256 项，收到 {sbox_table.size} 项')
     B = block.shape[0]
 
     # ---- 快速路径：单一密钥（批量候选只差 S-box）时，round key 在 CPU 上算一次 ----
@@ -416,29 +455,55 @@ def aes_ecb(block, key, sbox_table=None, a_idx=None, b_val=None):
 aes192_ecb = aes_ecb
 
 
+def _cuda_sync():
+    """只在真正用 CUDA 时同步；torch-cpu 后端调用 torch.cuda.* 会抛 RuntimeError。"""
+    if BACKEND == "torch-cuda":
+        torch.cuda.synchronize()
+
+
+def _bench_text_lines(rows, markdown=False):
+    """bench 人读/Markdown 输出行（纯函数，便于自测输出契约）。"""
+    if markdown:
+        lines = ['| 内核 | 吞吐 | 批量 | 耗时 |', '|---|---|---|---|']
+        lines += [f'| `{label}` | {rate} {unit} | {cnt} | {sec*1e3:.0f} ms |'
+                  for label, rate, unit, cnt, sec in rows]
+        return lines
+    return [f"[{label:<8}] {rate} {unit}  ({sec*1e3:.0f} ms, {cnt})"
+            for label, rate, unit, cnt, sec in rows]
+
+
+def _bench_json_objs(rows):
+    """bench --json 的逐内核事件对象（纯函数，便于自测输出契约）。"""
+    return [{'event': 'bench', 'kernel': label, 'rate': float(rate), 'unit': unit,
+             'count': cnt, 'seconds': round(sec, 6)}
+            for label, rate, unit, cnt, sec in rows]
+
+
 def cmd_bench(a):
     T = xp()
-    print(f"[backend] {BACKEND}  device={DEV}")
-    if BACKEND.startswith("torch"):
-        print(f"[device ] {torch.cuda.get_device_name(0)}  "
-              f"VRAM {torch.cuda.get_device_properties(0).total_memory/2**30:.1f} GiB")
+    md = bool(getattr(a, 'markdown', False))
+    js = C.json_mode()
+    # 横幅属于提示：--markdown 时 stdout 只留 Markdown 表格，--json 时只留 JSON 行
+    text_out = not (md or js or C.quiet())
+    if text_out:
+        print(f"[backend] {BACKEND}  device={DEV}")
+        if BACKEND == "torch-cuda":
+            print(f"[device ] {torch.cuda.get_device_name(0)}  "
+                  f"VRAM {torch.cuda.get_device_properties(0).total_memory/2**30:.1f} GiB")
 
     def warm(fn, *args):
         """预热：触发 JIT 编译 + 缓存分配，避免首次调用被计入耗时。"""
         for _ in range(3):
             fn(*args)
-        if BACKEND.startswith("torch"):
-            torch.cuda.synchronize()
+        _cuda_sync()
 
-    md = bool(getattr(a, 'markdown', False))
     rows = []
 
     def _timed(fn, *args):
         warm(fn, *args)
         t0 = time.time()
         fn(*args)
-        if BACKEND.startswith("torch"):
-            torch.cuda.synchronize()
+        _cuda_sync()
         return time.time() - t0
 
     # 1) popcount 吞吐
@@ -467,77 +532,104 @@ def cmd_bench(a):
         rows.append((f'aes{kl * 8}', f"{blk.shape[0]/dt/1e3:.1f}", 'K blocks/s',
                      f'{blk.shape[0]} 块', dt))
 
-    if md:
-        print('| 内核 | 吞吐 | 批量 | 耗时 |')
-        print('|---|---|---|---|')
-        for label, rate, unit, cnt, sec in rows:
-            print(f'| `{label}` | {rate} {unit} | {cnt} | {sec*1e3:.0f} ms |')
+    if js:
+        for obj in _bench_json_objs(rows):
+            C.emit(obj)
     else:
-        for label, rate, unit, cnt, sec in rows:
-            print(f"[{label:<8}] {rate} {unit}  ({sec*1e3:.0f} ms, {cnt})")
+        for line in _bench_text_lines(rows, md):
+            print(line)
 
 
 def cmd_mtscan(a):
     """暴力 mt19937 种子 → 24B 密钥，比对目标。"""
     T = xp()
-    target = bytes.fromhex(a.key_hex)
+    target = parse_hex(a.key_hex, '--key-hex')
+    if target is None:
+        return C.fail(f"--key-hex 不是合法裸 hex：{a.key_hex!r}")
     L = len(target)
     if not 1 <= L <= 24:
-        print(f"[错误] --key-hex 需 1~24 字节（mt19937 每次只生成 24B 密钥），实际 {L} 字节",
-              file=sys.stderr)
-        return 2
+        return C.fail(f"--key-hex 需 1~24 字节（mt19937 每次只生成 24B 密钥），实际 {L} 字节")
     if a.seed_count <= 0:
-        print("[错误] --seed-count 必须 > 0", file=sys.stderr)
-        return 2
+        return C.fail("--seed-count 必须 > 0")
+    if a.seed_start < -(2 ** 63) or a.seed_start + a.seed_count > 2 ** 63 - 1:
+        return C.fail("--seed-start/--seed-count 超出 int64 可表示范围")
+    twist = (a.twist == 1)
     tgt_t = (T.tensor(list(target), dtype=T.uint8, device=DEV) if BACKEND.startswith("torch")
              else np.frombuffer(target, dtype=np.uint8))
+
+    def _key_of(seed):
+        """按种子重算完整密钥（命中复核 / 过滤断点里的陈旧命中）。"""
+        seeds = (T.tensor([seed], dtype=T.int64, device=DEV) if BACKEND.startswith("torch")
+                 else np.array([seed], dtype=np.int64))
+        return np.asarray(from_dev(mt19937_keys(seeds, twist=twist, nbytes=L)[0]),
+                          dtype=np.uint8)
 
     def _step(lo, hi):
         cnt = hi - lo
         seeds = (T.arange(lo, hi, dtype=T.int64, device=DEV) if BACKEND.startswith("torch")
                  else np.arange(lo, hi, dtype=np.int64))
-        keys = mt19937_keys(seeds, twist=(a.twist == 1))[:, :L]
+        keys = mt19937_keys(seeds, twist=twist, nbytes=L)
         eq = (keys == tgt_t).all(axis=1)
         out = []
         if bool(eq.any()):
-            idx = from_dev(eq.nonzero()[0] if BACKEND.startswith("torch") else eq.nonzero()[0])
-            out = [int(lo) + int(i) for i in np.atleast_1d(idx)]
+            out = [int(lo) + int(i) for i in hit_indices(eq)]
         return cnt, out
 
     total, found, dt = C.chunked(_step, a.seed_count, start=a.seed_start, chunk=a.chunk,
                                  label='mtscan', checkpoint=getattr(a, 'checkpoint', ''),
                                  reset=getattr(a, 'reset_checkpoint', False),
                                  progress=not getattr(a, 'no_progress', False),
+                                 ckpt_meta={'kind': 'mtscan', 'key_hex': target.hex(),
+                                            'twist': int(a.twist)},
                                  on_hit=lambda h: True)
     C.info(f"[done] {total:,} 个种子 / {dt:.2f}s = {total/max(dt,1e-9)/1e6:.1f} M seeds/s")
-    if found:
-        for s in found:
-            k = from_dev(mt19937_keys((T.tensor([s], dtype=T.int64, device=DEV) if BACKEND.startswith("torch")
-                                       else np.array([s])), twist=(a.twist == 1))[0])
-            C.emit({'event': 'hit', 'kind': 'mtscan', 'seed': s, 'key': bytes(k[:L]).hex(),
-                    'text': f"  ★ 命中 seed={s}  key={bytes(k[:L]).hex()}"})
+    # 断点里可能残留其它任务/其它目标的历史命中：只承认与当前目标真正一致的种子
+    verified, stale = [], 0
+    seen = set()
+    for s in found:
+        if isinstance(s, bool) or not isinstance(s, (int, np.integer)):
+            stale += 1
+            continue
+        s = int(s)
+        if s in seen:
+            continue
+        seen.add(s)
+        if _key_of(s).tobytes() == target:
+            verified.append(s)
+        else:
+            stale += 1
+    if stale:
+        C.info(f"[warn] 忽略断点中 {stale} 条与当前 --key-hex 不匹配的历史命中")
+    if verified:
+        for s in verified:
+            k = bytes(_key_of(s)[:L]).hex()
+            C.emit({'event': 'hit', 'kind': 'mtscan', 'seed': s, 'key': k,
+                    'text': f"  ★ 命中 seed={s}  key={k}"})
     else:
         C.emit({'event': 'result', 'kind': 'mtscan', 'hits': 0, 'scanned': total,
                 'text': "  未命中"})
 
 
 def cmd_sboxscan(a):
-    """枚举 S-box 破坏 (a,b) → AES-192 加密，比对目标密文。"""
+    """枚举 S-box 破坏 (a,b) → AES-128/192/256 加密，比对目标密文。"""
     T = xp()
-    plain = bytes.fromhex(a.plain_hex)
-    target = bytes.fromhex(a.cipher_hex)
-    key = bytes.fromhex(a.key_hex)
+    plain = parse_hex(a.plain_hex, '--plain-hex')
+    target = parse_hex(a.cipher_hex, '--cipher-hex')
+    key = parse_hex(a.key_hex, '--key-hex')
+    for opt, val, raw in (('--plain-hex', plain, a.plain_hex),
+                          ('--cipher-hex', target, a.cipher_hex),
+                          ('--key-hex', key, a.key_hex)):
+        if val is None:
+            return C.fail(f"{opt} 不是合法裸 hex：{raw!r}")
     if len(plain) == 0 or len(plain) % 16 or len(plain) != len(target):
-        print(f"[错误] 明文/密文须等长、16 字节整数倍且非空（明文 {len(plain)}B，密文 {len(target)}B）",
-              file=sys.stderr)
-        return 2
+        return C.fail(f"明文/密文须等长、16 字节整数倍且非空（明文 {len(plain)}B，密文 {len(target)}B）")
     if len(key) not in (16, 24, 32):
         return C.fail(f"AES 密钥需 16/24/32 字节，实际 {len(key)} 字节")
 
     pairs = [(x, y) for x in range(256) for y in range(256) if x != y]
     pairs = np.array(pairs, dtype=np.int64)
     n = pairs.shape[0]
-    print(f"[scan] {n} 种 (a,b) 组合，{len(plain)//16} 块")
+    C.info(f"[scan] {n} 种 (a,b) 组合，{len(plain)//16} 块")
 
     blk0 = (T.tensor(list(plain[:16]), dtype=T.uint8, device=DEV) if BACKEND.startswith("torch")
             else np.frombuffer(plain[:16], dtype=np.uint8))
@@ -558,46 +650,81 @@ def cmd_sboxscan(a):
         eq = (out == tgt0).all(axis=1)
         got = []
         if bool(eq.any()):
-            idx = np.atleast_1d(from_dev(eq.nonzero()[0] if BACKEND.startswith("torch") else eq.nonzero()[0]))
-            for j in idx:
+            for j in hit_indices(eq):
                 got.append([int(p[j][0]), int(p[j][1])])
         return hi - lo, got
 
     total, hits, dt = C.chunked(_step, n, chunk=a.chunk, label='sboxscan',
                                 checkpoint=getattr(a, 'checkpoint', ''),
                                 reset=getattr(a, 'reset_checkpoint', False),
-                                progress=not getattr(a, 'no_progress', False))
-    hits = [tuple(h) for h in hits]
+                                progress=not getattr(a, 'no_progress', False),
+                                ckpt_meta={'kind': 'sboxscan', 'plain_hex': plain.hex(),
+                                           'cipher_hex': target.hex(), 'key_hex': key.hex()})
     C.info(f"[done] {total} 组合 / {dt:.2f}s = {total/max(dt,1e-9)/1e3:.1f} K/s")
-    # 用全部块验证
-    for (x, y) in hits:
-        ok = True
+
+    # 用全部块验证；顺带过滤断点文件里可能残留的其它任务/其它目标命中。
+    # 批量验证（每批最多 8192 个候选 × 每块一次 aes_ecb），避免逐候选 Python 循环。
+    hits_clean, dropped = [], 0
+    seen = set()
+    for h in hits:
+        if not isinstance(h, (list, tuple)) or len(h) != 2:
+            dropped += 1
+            continue
+        try:
+            x, y = int(h[0]), int(h[1])
+        except (TypeError, ValueError):
+            dropped += 1
+            continue
+        if not (0 <= x < 256 and 0 <= y < 256) or x == y:
+            dropped += 1
+            continue
+        if (x, y) in seen:
+            continue
+        seen.add((x, y))
+        hits_clean.append((x, y))
+    tgt_np = np.frombuffer(target, dtype=np.uint8)
+    verified = []
+    vbatch = 8192
+    for i in range(0, len(hits_clean), vbatch):
+        blk_hits = hits_clean[i:i + vbatch]
+        H = len(blk_hits)
+        xs = np.array([h[0] for h in blk_hits], dtype=np.uint8)
+        ys = np.array([h[1] for h in blk_hits], dtype=np.uint8)
+        keep = np.ones(H, dtype=bool)
         for off in range(0, len(plain), 16):
-            pb = (T.tensor(list(plain[off:off+16]), dtype=T.uint8, device=DEV).unsqueeze(0) if BACKEND.startswith("torch")
-                  else np.frombuffer(plain[off:off+16], dtype=np.uint8)[None, :])
-            ai = (T.tensor([[x]], dtype=T.uint8, device=DEV) if BACKEND.startswith("torch") else np.array([[x]], dtype=np.uint8))
-            bv = (T.tensor([[int(INV_SBOX[y])]], dtype=T.uint8, device=DEV) if BACKEND.startswith("torch")
-                  else np.array([[int(INV_SBOX[y])]], dtype=np.uint8))
-            out = from_dev(aes192_ecb(pb, key_t, None, ai, bv))[0]
-            if out.tobytes() != target[off:off+16]:
-                ok = False; break
-        C.emit({'event': 'hit', 'kind': 'sboxscan', 'a': x, 'b': y, 'verified': bool(ok),
-                'text': f"  ★ (a,b)=({x},{y})  全块验证={'通过' if ok else '仅首块'}"})
-    if not hits:
+            pb = np.frombuffer(plain[off:off + 16], dtype=np.uint8)
+            blk = (T.tensor(np.tile(pb, (H, 1)), dtype=T.uint8, device=DEV)
+                   if BACKEND.startswith("torch") else np.tile(pb, (H, 1)))
+            ai = (T.tensor(xs, dtype=T.uint8, device=DEV).unsqueeze(1)
+                  if BACKEND.startswith("torch") else xs[:, None])
+            bv = (T.tensor(INV_SBOX[ys], dtype=T.uint8, device=DEV).unsqueeze(1)
+                  if BACKEND.startswith("torch") else INV_SBOX[ys][:, None])
+            out = np.asarray(from_dev(aes192_ecb(blk, key_t, None, ai, bv)))
+            keep &= (out == tgt_np[off:off + 16]).all(axis=1)
+            if not keep.any():
+                break
+        dropped += int(H - int(keep.sum()))
+        verified.extend([h for h, v in zip(blk_hits, keep) if v])
+    if dropped:
+        C.info(f"[warn] 丢弃 {dropped} 条未通过全块验证/非法的候选（断点可能来自其它目标）")
+    for (x, y) in verified:
+        C.emit({'event': 'hit', 'kind': 'sboxscan', 'a': x, 'b': y, 'verified': True,
+                'text': f"  ★ (a,b)=({x},{y})  全块验证=通过"})
+    if not verified:
         C.emit({'event': 'result', 'kind': 'sboxscan', 'hits': 0, 'text': "  未命中"})
 
 
 def cmd_ksscore(a):
     """候选密钥流 vs 目标/样本 的比特一致度打分（统计淘汰）。"""
     T = xp()
-    tgt = bytes.fromhex(a.target_hex)
+    tgt = parse_hex(a.target_hex, '--target-hex')
+    if tgt is None:
+        return C.fail(f"--target-hex 不是合法裸 hex：{a.target_hex!r}")
     L = len(tgt)
     if L == 0:
-        print("[错误] --target-hex 不能为空", file=sys.stderr)
-        return 2
+        return C.fail("--target-hex 不能为空")
     if a.candidates <= 0:
-        print("[错误] --candidates 必须 > 0", file=sys.stderr)
-        return 2
+        return C.fail("--candidates 必须 > 0")
     tgt_t = (T.tensor(list(tgt), dtype=T.uint8, device=DEV) if BACKEND.startswith("torch")
              else np.frombuffer(tgt, dtype=np.uint8))
     best = {'score': -1, 'cand': None}
@@ -619,7 +746,8 @@ def cmd_ksscore(a):
     done, _hits, dt = C.chunked(_step, a.candidates, chunk=a.chunk, label='ksscore',
                                 checkpoint=getattr(a, 'checkpoint', ''),
                                 reset=getattr(a, 'reset_checkpoint', False),
-                                progress=not getattr(a, 'no_progress', False))
+                                progress=not getattr(a, 'no_progress', False),
+                                ckpt_meta={'kind': 'ksscore', 'target_hex': tgt.hex()})
     C.info(f"[done] {done:,} 候选 × {L}B / {dt:.2f}s = {done/max(dt,1e-9)/1e6:.2f} M cand/s")
     C.emit({'event': 'result', 'kind': 'ksscore', 'scanned': done, 'bits': L * 8,
             'best_score': best['score'], 'best_candidate': best['cand'],
@@ -633,27 +761,29 @@ def cmd_lfsrscan(a):
     """
     T = xp()
     if not a.bits or set(a.bits) - set("01"):
-        print("[错误] --bits 只能是 0/1 组成的比特串", file=sys.stderr)
-        return 2
+        return C.fail("--bits 只能是 0/1 组成的非空比特串")
     target_bits = np.array([int(c) for c in a.bits], dtype=np.int64)
     groups = []
     for g in a.taps.split(";"):
         g = g.strip()
         parts = g.split(":")
         if len(parts) != 2:
-            print(f"[错误] --taps 组格式应为 n:tap1,tap2,...，收到 {g!r}", file=sys.stderr)
-            return 2
+            return C.fail(f"--taps 组格式应为 n:tap1,tap2,...，收到 {g!r}")
         n_str, tap_str = parts
-        taps = [int(t) for t in tap_str.split(",") if t.strip()]
-        n = int(n_str)
+        try:
+            n = int(n_str)
+            taps = [int(t) for t in tap_str.split(",") if t.strip()]
+        except ValueError:
+            return C.fail(f"--taps 组 {g!r} 含非整数：n 与每个 tap 都必须是十进制整数")
         if n <= 0 or not taps or any(t < 1 or t > n for t in taps):
-            print(f"[错误] --taps 组 {g!r} 非法：状态数 n 需 >0，且每个 tap 必须在 1..n", file=sys.stderr)
-            return 2
+            return C.fail(f"--taps 组 {g!r} 非法：状态数 n 需 >0，且每个 tap 必须在 1..n")
         groups.append((n, taps))
     if a.trials <= 0:
-        print("[错误] --trials 必须 > 0", file=sys.stderr)
-        return 2
-    C.info(f"[scan] {len(groups)} 组 LFSR，目标 {len(target_bits)} 拍")
+        return C.fail("--trials 必须 > 0")
+    if a.rng_seed < 0:
+        return C.fail("--rng-seed 必须 >= 0")
+    Tlen = len(target_bits)
+    C.info(f"[scan] {len(groups)} 组 LFSR，目标 {Tlen} 拍")
 
     rng = np.random.default_rng(a.rng_seed)
     trials = a.trials
@@ -661,83 +791,122 @@ def cmd_lfsrscan(a):
     t0 = time.time()
     for g in range(len(groups)):
         n, taps = groups[g]
-        state = rng.integers(0, 2, size=(trials, n), dtype=np.int64)
-        if BACKEND.startswith("torch"):
-            st = torch.tensor(state, device=DEV)
-            taps_t = torch.tensor([t - 1 for t in taps], device=DEV)
-            outs = []
-            for _ in range(len(target_bits)):
-                fb = st[:, taps_t[0]].clone()
-                for t in taps_t[1:]:
-                    fb ^= st[:, t]
-                outs.append(fb)
-                st = torch.cat([fb.unsqueeze(1), st[:, :-1]], dim=1)
-            seq = torch.stack(outs, dim=1)
-            sc = (seq == torch.tensor(target_bits, device=DEV)).sum(1)
-        else:
-            st = state.copy()
-            outs = np.empty((trials, len(target_bits)), dtype=np.int64)
-            taps_i = [t - 1 for t in taps]
-            for k in range(len(target_bits)):
-                fb = st[:, taps_i[0]].copy()
-                for t in taps_i[1:]:
-                    fb ^= st[:, t]
-                outs[:, k] = fb
-                st = np.concatenate([fb[:, None], st[:, :-1]], axis=1)
-            sc = (outs == target_bits).sum(1)
-        m = int(from_dev(sc).max())
+        try:
+            state = rng.integers(0, 2, size=(trials, n), dtype=np.int64)
+        except (MemoryError, ValueError) as exc:
+            return C.fail(f"初始状态内存不足（trials={trials}, n={n}）：{exc}")
+        try:
+            if BACKEND.startswith("torch"):
+                st = torch.tensor(state, device=DEV)
+                taps_t = torch.tensor([t - 1 for t in taps], device=DEV)
+                score = torch.zeros(trials, dtype=torch.int64, device=DEV)
+                # 逐拍累加一致位数（不再保留 [trials, 拍数] 大矩阵，长比特流也不爆内存）
+                for k in range(Tlen):
+                    fb = st[:, taps_t[0]].clone()
+                    for t in taps_t[1:]:
+                        fb ^= st[:, t]
+                    score += (fb == target_bits[k]).to(torch.int64)
+                    st = torch.cat([fb.unsqueeze(1), st[:, :-1]], dim=1)
+                m = int(score.max().item())
+            else:
+                st = state.copy()
+                taps_i = [t - 1 for t in taps]
+                score = np.zeros(trials, dtype=np.int64)
+                for k in range(Tlen):
+                    fb = st[:, taps_i[0]].copy()
+                    for t in taps_i[1:]:
+                        fb ^= st[:, t]
+                    score += (fb == target_bits[k])
+                    st = np.concatenate([fb[:, None], st[:, :-1]], axis=1)
+                m = int(score.max())
+        except MemoryError as exc:
+            return C.fail(f"内存/显存不足（trials={trials}, n={n}, bits={Tlen}）：{exc}")
+        except RuntimeError as exc:
+            if 'out of memory' in str(exc).lower():
+                return C.fail(f"显存不足（trials={trials}, n={n}, bits={Tlen}）：{exc}")
+            raise
         if m > best:
             best = m
         C.emit({'event': 'result', 'kind': 'lfsrscan', 'group': g + 1, 'n': n, 'taps': taps,
-                'best': int(m), 'bits': len(target_bits),
-                'text': f"  组{g+1} (n={n}, taps={taps}): 最佳 {m}/{len(target_bits)} 位"})
+                'best': int(m), 'bits': Tlen,
+                'text': f"  组{g+1} (n={n}, taps={taps}): 最佳 {m}/{Tlen} 位"})
     dt = time.time() - t0
-    C.info(f"[done] {trials*len(groups):,} 组状态 × {len(target_bits)} 拍 / {dt:.2f}s")
+    C.info(f"[done] {trials*len(groups):,} 组状态 × {Tlen} 拍 / {dt:.2f}s")
 
 
 # ---------------------------------------------------------------- CLI
-def main():
+# 全局参数（7 个）的唯一定义；主解析器和各子命令解析器都注册一遍，
+# 子命令后的副本用 SUPPRESS 默认值，这样"全局参数写在子命令前后都行"。
+_GLOBAL_SPECS = (
+    (('--backend',), dict(default='auto', choices=['auto', 'torch', 'numpy'],
+                          help='计算后端：auto=torch-cuda→torch-cpu→numpy（默认 auto；子命令前后均可）')),
+    (('--chunk',), dict(type=int, default=1 << 16,
+                        help='每批候选数（默认 65536；显存不足时自动减半；子命令前后均可）')),
+    (('--json',), dict(action='store_true', default=False,
+                       help='结果行改为单行 JSON（机器可读；子命令前后均可）')),
+    (('--quiet',), dict(action='store_true', default=False,
+                        help='抑制横幅与进度，只保留结果行（子命令前后均可）')),
+    (('--no-progress',), dict(action='store_true', default=False,
+                              help='不打印进度/ETA，结果仍输出（子命令前后均可）')),
+    (('--checkpoint',), dict(default='', metavar='FILE',
+                             help='断点文件：每块落盘一次，中断后从上次位置续跑（子命令前后均可）')),
+    (('--reset-checkpoint',), dict(action='store_true', default=False,
+                                   help='忽略已有断点，从头开始（子命令前后均可）')),
+)
+
+
+def _add_global_args(parser, *, after_sub=False):
+    """注册全局参数；after_sub=True 时默认置 SUPPRESS，避免覆盖子命令前已解析出的值。"""
+    for flags, kw in _GLOBAL_SPECS:
+        kw = dict(kw)
+        if after_sub:
+            kw['default'] = argparse.SUPPRESS
+        parser.add_argument(*flags, **kw)
+
+
+def main(argv=None):
     ap = argparse.ArgumentParser(
         description="gpu_crack — GPU 批量爆破/校验框架（完整说明见 CLI_REFERENCE.md）",
         formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
-    ap.add_argument("--backend", default="auto", choices=["auto", "torch", "numpy"],
-                    help="计算后端：auto=torch-cuda→torch-cpu→numpy（默认 auto）")
-    ap.add_argument("--chunk", type=int, default=1 << 16,
-                    help="每批候选数（默认 65536；显存不足时自动减半）")
-    C.add_output_args(ap)
-    C.add_sched_args(ap)
-    sub = ap.add_subparsers(dest="cmd", required=True, metavar="{bench,mtscan,sboxscan,ksscore,lfsrscan}")
+    _add_global_args(ap)
+    sub = ap.add_subparsers(dest="cmd", required=True,
+                            metavar="{bench,mtscan,sboxscan,ksscore,lfsrscan}")
 
     p = sub.add_parser("bench", help="基准测试：当前机器/后端的吞吐（正式搜索前先跑）")
+    _add_global_args(p, after_sub=True)
     p.add_argument("--markdown", action="store_true",
-                   help="输出 Markdown 表格（可直接写入 docs/bench.md）")
+                   help="输出 Markdown 表格（可直接写入 docs/bench.md；stdout 只留表格）")
 
     p = sub.add_parser("mtscan", help="暴力 mt19937 种子 -> 24B 密钥，与目标比对")
+    _add_global_args(p, after_sub=True)
     p.add_argument("--key-hex", required=True, help="目标密钥/密钥流前缀，裸 hex，1~24 字节")
     p.add_argument("--seed-start", type=int, default=0, help="起始种子（含），默认 0")
     p.add_argument("--seed-count", type=int, default=1 << 24, help="扫描种子个数，默认 16777216")
     p.add_argument("--twist", type=int, default=0, choices=[0, 1],
                    help="0=init_genrand 后直接读状态（魔改版常见，默认）；1=标准 std::mt19937")
 
-    p = sub.add_parser("sboxscan", help="枚举 AES-192 S-box 破坏 (a,b)，匹配明文/密文对")
+    p = sub.add_parser("sboxscan", help="枚举 AES-128/192/256 S-box 破坏 (a,b)，匹配明文/密文对")
+    _add_global_args(p, after_sub=True)
     p.add_argument("--plain-hex", required=True, help="明文块序列，裸 hex，16 字节整数倍且非空")
     p.add_argument("--cipher-hex", required=True, help="目标密文，裸 hex，与明文等长")
-    p.add_argument("--key-hex", required=True, help="AES-192 密钥，裸 hex，24 字节")
+    p.add_argument("--key-hex", required=True, help="AES 密钥，裸 hex，16/24/32 字节")
 
     p = sub.add_parser("ksscore", help="候选密钥流 vs 目标比特一致度打分（统计淘汰）")
+    _add_global_args(p, after_sub=True)
     p.add_argument("--target-hex", required=True, help="目标密钥流，裸 hex，>=1 字节")
     p.add_argument("--candidates", type=int, default=1 << 20, help="随机候选个数，默认 1048576")
 
     p = sub.add_parser("lfsrscan", help="多条 LFSR 并行仿真，匹配目标比特流")
+    _add_global_args(p, after_sub=True)
     p.add_argument("--taps", required=True, help='抽头，如 "25:10,11,24;28:12,22,25"（tap 从 1 开始）')
     p.add_argument("--bits", required=True, help="目标输出比特流，仅含 0/1 的字符串")
     p.add_argument("--trials", type=int, default=1 << 16, help="每组随机初始状态数，默认 65536")
     p.add_argument("--rng-seed", type=int, default=1, help="随机种子，默认 1（双后端结果一致）")
 
-    a = ap.parse_args()
+    a = ap.parse_args(argv)
     C.apply_output_args(a)
     if a.chunk < 1:
-        ap.error("--chunk 必须 >= 1")
+        return C.fail("--chunk 必须 >= 1")
     name, dev = init_backend(a.backend)
     C.info(f"[backend] {name}  device={dev}\n")
     rc = {"bench": cmd_bench, "mtscan": cmd_mtscan, "sboxscan": cmd_sboxscan,

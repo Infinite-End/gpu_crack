@@ -1,4 +1,4 @@
-﻿---
+---
 name: ctf-toolkit
 description: GPU-accelerated, command-line CTF toolkit in this repository for batch brute-force and triage (MT19937 seed scan, AES S-box fault scan, ChaCha20/RC4/AES-CTR keystream, RS(63,31) syndrome, TEA/XTEA/XXTEA/Speck, LCG recovery, MD5 cracking, RSA multi-attack, multi-layer decoding, image LSB/stegscan, image diff, ROP gadgets, ELF recon, cyclic offsets). Use when a CTF task requires trying many candidates at once, identifying an unknown cipher, recovering keys/keystreams, extracting hidden data from images or files, or computing pwn offsets and gadgets.
 ---
@@ -7,11 +7,11 @@ description: GPU-accelerated, command-line CTF toolkit in this repository for ba
 
 | 文档属性 | 值 |
 |---|---|
-| 文档版本 | v3.1（2026-11-09） |
+| 文档版本 | v3.2（2026-11-09） |
 | 适用工具 | gpu_crack toolkit v2（仓库根目录） |
-| 校验状态 | `ctf.py selftest` 全 PASS；`consistency.py` 32/32 |
+| 校验状态 | `python -X utf8 verify_all.py` 六层全绿（doc_lint 50 / 模块 13+31+23 / 主框架 42 / consistency 45/45 / fuzz 17 类 / 统一入口+示例 6/6） |
 | 配套文档 | `CLI_REFERENCE.md`（仓库根，规范性参数/输出/退出码）、`README.md`（仓库根）、`references/kernels.md`、`SKILL.en.md`（英文精简版） |
-| 内核清单 | 真源 `ctf_registry.py`；插件放 `plugins/*.py`（模块级 `KERNEL` 元数据），不改仓库即可扩展；插件不计入 30 个内置子命令 |
+| 内核清单 | 真源 `ctf_registry.py`（含 `VERSION`）；插件放 `plugins/*.py`（模块级 `KERNEL` 元数据），不改仓库即可扩展；插件不计入 30 个内置子命令 |
 
 本 skill 是**可被任意模型复用**的操作规范。所有事实以仓库文档为准，不要凭记忆猜参数：
 命令行细节查仓库根的 `CLI_REFERENCE.md`，项目说明查 `README.md`。
@@ -22,8 +22,9 @@ description: GPU-accelerated, command-line CTF toolkit in this repository for ba
 |---|---|
 | 工具箱目录 | `CTF_TOOLKIT_DIR`（有效时）→ 从 `scripts/ctf.py` 向上查找 `gpu_crack.py` → 向上两级；skill 目录被单独拷出仓库时须设 `CTF_TOOLKIT_DIR` |
 | GPU 解释器 | PATH 上的 `python3` / `python`（需 torch + CUDA；也可用 `CTF_PYTHON` 强制指定） |
-| 解释器覆盖 | 环境变量 `CTF_PYTHON`（设置且存在时优先） |
-| 统一入口 | `scripts/ctf.py`（本 skill 内） |
+| 解释器覆盖 | 环境变量 `CTF_PYTHON`（设置且存在时优先；指向非 Python 会告警回退） |
+| 解释器缓存 | 探测结果缓存在用户缓存目录（`%LOCALAPPDATA%\gpu_crack\` 或 `~/.cache/gpu_crack/`）；`CTF_NO_PY_CACHE=1` 关闭，`CTF_PY_CACHE=路径` 改位置 |
+| 统一入口 | `scripts/ctf.py`（本 skill 内）；`selfcheck` 可自检入口本身，`help <module>` 看单模块帮助 |
 | 参考文档 | `<skill>/references/kernels.md`（一页速查）、`CLI_REFERENCE.md`（完整参数/输出/退出码） |
 | 后端 | `--backend auto|torch|numpy`；`ctf_misc.py` 纯 CPU，无此参数 |
 | 分块 | `--chunk N`（gpu_crack 默认 65536、ctf_tools 默认 16384；**OOM 自动减半重试**） |
@@ -132,17 +133,28 @@ python $ctf lsb --img chal.png           # 再看 LSB 候选（score 降序）
 
 ## 7. 质量门禁（仅当你要修改工具箱代码时）
 
-按顺序执行，全绿才允许交付：
+一条命令跑完全部六层（推荐；CI 也用同一入口）：
 
 ```powershell
-python -X utf8 ctf_tools.py selftest     # 以及 ctf_ext.py / ctf_misc.py selftest
-python -X utf8 selftest.py
-python -X utf8 consistency.py            # 期望: 通过 32/32
-python $ctf selftest                                  # 期望: 四模块全 PASS, 退出码 0
+python -X utf8 verify_all.py                  # 六层全绿 = 可交付
+python -X utf8 verify_all.py --backend numpy  # 无 GPU 环境
+python -X utf8 verify_all.py --quick --only doc,fuzz   # 快速定位
+```
+
+分项对应（`verify_all.py --list` 可看层名）：
+
+```powershell
+python -X utf8 doc_lint.py                  # 第 1 层：文档/CLI/版本/矩阵一致
+python -X utf8 ctf_tools.py selftest        # 第 2 层：三个模块已知向量（ctf_ext/ctf_misc 同理）
+python -X utf8 selftest.py                  # 第 3 层：主框架 AES/mt19937/植入-找回
+python -X utf8 consistency.py               # 第 4 层：跨实现固定向量（通过 45/45）
+python -X utf8 fuzz_kernels.py --quick      # 第 5 层：17 类随机差分对拍
+python $ctf selftest                        # 第 6 层：统一入口组合自测
 ```
 
 验收标准：① 已知向量 PASS；② 双后端一致；③ 参数错误是干净报错（rc=1/2，无 traceback）；
-④ 新行为同步写入 `CLI_REFERENCE.md`（必要时 README）。
+④ 新行为同步写入 `CLI_REFERENCE.md`（必要时 README），且 `doc_lint.py` ALL PASS
+（版本号真源是 `ctf_registry.VERSION`，不要在文档里写死版本）。
 
 ## 8. 失败处理速查
 

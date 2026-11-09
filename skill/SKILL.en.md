@@ -101,7 +101,9 @@ interactive Windows console it keeps the system code page instead.
 
 - Run `python scripts/ctf.py selftest` before and after touching any kernel.
 - Run `consistency.py` from the repository root after editing crypto kernels: it cross-checks the same
-  answer through torch, numpy, pure-Python references, pycryptodome and `cryptography` (32 assertions).
+  answer through torch, numpy, pure-Python references, pycryptodome and `cryptography` (45 assertions).
+- Run `python -X utf8 fuzz_kernels.py --quick` for randomized differential testing against independent
+  reference implementations (17 kernel categories; `verify_all.py` runs every layer in one command).
 - Prefer the cheap predicate first: compare a 4-byte prefix or run XOR+popcount scoring, and only then
   run the full check (Poly1305 tag, complete AES block). This ordering is the single biggest speedup.
 - Re-verify every hit through a **second, independent path** (decrypt with the recovered key and compare;

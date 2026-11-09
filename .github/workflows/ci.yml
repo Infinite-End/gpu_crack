@@ -24,31 +24,57 @@ jobs:
           pip install --index-url https://download.pytorch.org/whl/cpu torch
           pip install numpy pycryptodome cryptography pillow capstone pyelftools
 
-      - name: Docs consistency (params/flags/outputs/version)
-        run: python doc_lint.py
+      # 快速失败层：先跑文档/模块自测（失败原因更聚焦）
+      - name: Docs consistency (params/flags/version/matrix)
+        run: python -X utf8 doc_lint.py
 
       - name: Module self-tests
         run: |
-          python gpu_crack.py --backend numpy bench
-          python ctf_tools.py --backend numpy selftest
-          python ctf_ext.py --backend numpy selftest
-          python ctf_misc.py selftest
+          python -X utf8 gpu_crack.py --backend numpy bench
+          python -X utf8 ctf_tools.py --backend numpy selftest
+          python -X utf8 ctf_ext.py --backend numpy selftest
+          python -X utf8 ctf_misc.py selftest
 
       - name: Cross-backend consistency (fixed vectors)
-        run: python consistency.py
+        run: python -X utf8 consistency.py
 
       - name: Cross-backend consistency (random fuzz)
-        run: python consistency.py --fuzz 25
+        run: python -X utf8 consistency.py --fuzz 25
+
+      # 共享基础设施自检（注册表 / 公共调度 / 统一入口 / 解释器缓存）
+      - name: Registry self-check
+        run: python -X utf8 ctf_registry.py
+
+      - name: Common scheduler self-check
+        run: python -X utf8 ctf_common.py
+
+      - name: Dispatcher self-check (globals/exit codes/cache)
+        run: python -X utf8 skill/scripts/ctf.py selfcheck
+
+      - name: Dispatcher interpreter cache smoke
+        run: |
+          export CTF_PY_CACHE="$RUNNER_TEMP/ctf_py_cache.json"
+          python -X utf8 skill/scripts/ctf.py --backend numpy mtscan --key-hex ffffff \
+            --seed-count 500 --no-progress
+          python -X utf8 -c "import json,sys; d=json.load(open(sys.argv[1],encoding='utf-8')); assert d.get('entries') and d.get('aux') is not None, d" "$CTF_PY_CACHE"
+          # 第二次调用走缓存（不再探测解释器），行为必须一致
+          python -X utf8 skill/scripts/ctf.py --backend numpy mtscan --key-hex ffffff \
+            --seed-count 500 --no-progress
 
       - name: Dispatcher smoke test
         run: |
-          python skill/scripts/ctf.py selftest
-          python skill/scripts/ctf.py --json --quiet mtscan --key-hex ffffff --seed-start 0 --seed-count 3000
-          python skill/scripts/ctf.py --json --quiet mdext --algo md5 --orig-len 3 \
+          python -X utf8 skill/scripts/ctf.py selftest
+          python -X utf8 skill/scripts/ctf.py --json --quiet mtscan --key-hex ffffff \
+            --seed-start 0 --seed-count 3000
+          python -X utf8 skill/scripts/ctf.py --json --quiet mdext --algo md5 --orig-len 3 \
             --digest-hex 900150983cd24fb0d6963f7d28e17f72 --append-hex 00
-          python skill/scripts/ctf.py --quiet eccscan --curve secp256k1 \
-            --pub-hex 04000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000007 \
-            --start 0 --count 64 || true
+          python -X utf8 skill/scripts/ctf.py --quiet eccscan --curve secp256k1 \
+            --pub-hex 0479BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798483ADA7726A3C4655DA4FBFC0E1108A8FD17B448A68554199C47D08FFB10D4B8 \
+            --start 0 --count 64
 
-      - name: Examples generator
-        run: python examples/make_examples.py
+      - name: Examples --check (generate + rerun every example command)
+        run: python -X utf8 examples/make_examples.py --check
+
+      # 最终门禁：一键跑全部验证层（含 fuzz_kernels.py --quick；doc_lint 已在最前快速失败）
+      - name: Verify all layers
+        run: python -X utf8 verify_all.py --backend numpy

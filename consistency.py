@@ -20,6 +20,9 @@ consistency.py — 跨模块 / 跨后端的独立一致性校验
   LCG       : 恢复参数 → 预测，与实际序列逐项比对
   xorbrute  : 爆破结果必须是正确明文
   encode    : 多层解码结果必须等于原始明文
+  v3.2 增补 : TEA/XTEA/Speck64/128 官方向量、RC4 RFC6229、CRC32 标准 check 值、
+              AES-128/256 FIPS-197、AES-128 ECB SP800-38A、AES-192 CTR SP800-38A、
+              ChaCha20-Poly1305 RFC8439、MD5/SHA-1 长度扩展 padding 边界
 """
 from __future__ import annotations
 
@@ -358,6 +361,165 @@ def test_misc_crypto():
     check('encode 多层链式解码', got == b'flag{chain_ok}', f'{path} → {got}')
 
 
+# ---------------------------------------------------------------- v3.2 增补固定向量
+def test_known_vectors_extra():
+    """v3.2 增补的高价值固定向量（原有 32 项保持不变，本函数新增项单独计数）。
+
+    每个常量先与独立来源交叉验证（pycryptodome / zlib / 官方论文或 RFC），
+    防止把「记错的向量」写进基线：
+      TEA               Wheeler & Needham 官方向量（全零 key/pt）
+      XTEA              BouncyCastle / Go crypto/xtea 向量（大端词）
+      Speck64/128       NSA 论文官方向量
+      RC4               RFC 6229 §2（40-bit key 0102030405 前 16B）
+      CRC32             zlib 标准 check 值
+      AES-128/256       FIPS-197 附录 C（AESAVS 单块）
+      AES-128 ECB       NIST SP 800-38A F.1.1（4 块）
+      AES-192 CTR       NIST SP 800-38A F.5.3
+      ChaCha20-Poly1305 RFC 8439 §2.8.2
+      MD5/SHA-1         length-extension 边界（hashlib 独立验证）
+    """
+    from Crypto.Cipher import AES as RefAES
+    from Crypto.Cipher import ARC4 as RefARC4
+
+    # --- TEA 官方向量：key/pt 全零 → 41ea3a0a 94baa940 ---
+    tea = EXT.tea_encrypt_block(0, 0, [0, 0, 0, 0])
+    check('TEA 官方向量(0 key/0 pt)', tea == (0x41EA3A0A, 0x94BAA940),
+          f'{tea[0]:08x}{tea[1]:08x}')
+
+    # --- XTEA 官方向量：key=000102..0f（大端词），pt="ABCDEFGH" → 497df3d0 72612cb5 ---
+    kx_bytes = bytes.fromhex('000102030405060708090a0b0c0d0e0f')
+    kx = [int.from_bytes(kx_bytes[4 * i:4 * i + 4], 'big') for i in range(4)]
+    xtea = EXT.xtea_encrypt_block(0x41424344, 0x45464748, kx)
+    check('XTEA 官方向量(ABCDEFGH)', xtea == (0x497DF3D0, 0x72612CB5),
+          f'{xtea[0]:08x}{xtea[1]:08x}')
+
+    # --- XTEA 零密钥附加向量（BouncyCastle 测试集）---
+    z0 = EXT.xtea_encrypt_block(0, 0, [0, 0, 0, 0])
+    z1 = EXT.xtea_encrypt_block(0x41424344, 0x45464748, [0, 0, 0, 0])
+    check('XTEA 零密钥向量', z0 == (0xDEE9D4D8, 0xF7131ED9) and
+          z1 == (0xA0390589, 0xF8B8EFA5), f'{z0[0]:08x}{z0[1]:08x} {z1[0]:08x}{z1[1]:08x}')
+
+    # --- Speck64/128 NSA 官方向量：key=1b1a...0100, pt=3b7265747475432d ---
+    sp = EXT.speck_encrypt(0x3B7265747475432D, 0x1B1A1918131211100B0A090803020100,
+                           word_bits=32, key_words=4)
+    check('Speck64/128 NSA 向量', sp == 0x8C6FA548454E028B, f'{sp:016x}')
+
+    # --- RC4：RFC 6229 §2，40-bit key 0102030405 的前 16 字节 ---
+    rc4_ref = RefARC4.new(bytes.fromhex('0102030405')).encrypt(bytes(16))
+    rc4_ks = EXT.rc4_keystream(bytes.fromhex('0102030405'), 16)
+    check('RC4 RFC6229 向量', rc4_ks == rc4_ref ==
+          bytes.fromhex('b2396305f03dc027ccc3524a0a1118a8'), rc4_ks.hex())
+
+    # --- CRC32 标准 check 值（zlib 交叉）---
+    crc_cases = ((b'', 0x00000000), (b'a', 0xE8B7BE43),
+                 (b'The quick brown fox jumps over the lazy dog', 0x414FA339),
+                 (b'123456789', 0xCBF43926))
+    crc_ok = True
+    for data, want in crc_cases:
+        got_crc = int(TOOLS.crc32_batch(np.frombuffer(data, dtype=np.uint8).reshape(1, -1))[0])
+        if got_crc != want or zlib.crc32(data) != want:
+            crc_ok = False
+            break
+    check('CRC32 标准 check 值', crc_ok, f'{len(crc_cases)} 组 vs zlib')
+
+    # --- AES-128/256 FIPS-197 附录 C（numpy 后端 + torch 后端 + pycryptodome）---
+    pt1 = bytes.fromhex('00112233445566778899aabbccddeeff')
+    for klen, want_hex in ((16, '69c4e0d86a7b0430d8cdb78070b4c55a'),
+                           (32, '8ea2b7ca516745bfeafc49904b496089')):
+        key = bytes(range(klen))
+        G.init_backend('numpy')
+        out_np = bytes(G.from_dev(G.aes_ecb(
+            np.frombuffer(pt1, dtype=np.uint8).reshape(1, 16),
+            np.frombuffer(key, dtype=np.uint8)))[0])
+        G.init_backend('torch')
+        T = G.xp()
+        out_t = bytes(G.from_dev(G.aes_ecb(
+            T.tensor(list(pt1), dtype=T.uint8, device=G.DEV).unsqueeze(0),
+            T.tensor(list(key), dtype=T.uint8, device=G.DEV)))[0])
+        ref = RefAES.new(key, RefAES.MODE_ECB).encrypt(pt1)
+        check(f'AES-{klen * 8} NIST 向量',
+              out_np.hex() == want_hex == out_t.hex() == ref.hex(), out_np.hex())
+
+    # --- AES-128 ECB 多块：NIST SP 800-38A F.1.1 ---
+    key4 = bytes.fromhex('2b7e151628aed2a6abf7158809cf4f3c')
+    pt4 = bytes.fromhex('6bc1bee22e409f96e93d7e117393172a'
+                        'ae2d8a571e03ac9c9eb76fac45af8e51'
+                        '30c81c46a35ce411e5fbc1191a0a52ef'
+                        'f69f2445df4f9b17ad2b417be66c3710')
+    want4 = ('3ad77bb40d7a3660a89ecaf32466ef97'
+             'f5d3d58503b9699de785895a96fdbaaf'
+             '43b1cd7f598ece23881b00e3ed030688'
+             '7b0c785e27e8ad3f8223207104725dd4')
+    G.init_backend('numpy')
+    got4 = G.from_dev(G.aes_ecb(
+        np.frombuffer(pt4, dtype=np.uint8).reshape(4, 16),
+        np.frombuffer(key4, dtype=np.uint8))).tobytes()
+    G.init_backend('torch')
+    ref4 = RefAES.new(key4, RefAES.MODE_ECB).encrypt(pt4)
+    check('AES-128 ECB SP800-38A F.1.1', got4.hex() == want4 == ref4.hex(),
+          got4.hex()[:16] + '…')
+
+    # --- AES-192 CTR：NIST SP 800-38A F.5.3（16B 计数器块大端递增，vs pycryptodome）---
+    key192 = bytes.fromhex('8e73b0f7da0e6452c810f32b809079e562f8ead2522c6b7b')
+    init_block = bytes.fromhex('f0f1f2f3f4f5f6f7f8f9fafbfcfdfeff')
+    G.init_backend('numpy')
+    ours_ctr = TOOLS.aesctr_keystream(key192, init_block, 64, 0, 'be')
+    G.init_backend('torch')
+    ref_ctr = RefAES.new(key192, RefAES.MODE_CTR, nonce=b'',
+                         initial_value=int.from_bytes(init_block, 'big')).encrypt(bytes(64))
+    want_ctr = bytes.fromhex('717d2dc639128334a6167a488ded7921'
+                             'a72eb3bb14a556734b7bad6ab16100c5'
+                             '2efeae2d72b722613446dc7f4c2af918'
+                             'b9e783b30dd7924ff7bc9b97beaa8740')
+    check('AES-192 CTR SP800-38A F.5.3', ours_ctr == ref_ctr == want_ctr,
+          ours_ctr[:16].hex() + '…')
+
+    # --- ChaCha20-Poly1305 RFC 8439 §2.8.2（固定明文/AD/密钥，校验 CT+tag）---
+    aead_key = bytes.fromhex('808182838485868788898a8b8c8d8e8f'
+                             '909192939495969798999a9b9c9d9e9f')
+    aead_nonce = bytes.fromhex('070000004041424344454647')
+    aead_aad = bytes.fromhex('50515253c0c1c2c3c4c5c6c7')
+    aead_pt = bytes.fromhex(
+        '4c616469657320616e642047656e746c656d656e206f662074686520636c617373206f66'
+        '202739393a204966204920636f756c64206f6666657220796f75206f6e6c79206f6e6520'
+        '74697020666f7220746865206675747572652c2073756e73637265656e20776f756c6420'
+        '62652069742e')
+    aead_ct = ('d31a8d34648e60db7b86afbc53ef7ec2a4aded51296e08fea9e2b5a736ee62d6'
+               '3dbea45e8ca9671282fafb69da92728b1a71de0a9e060b2905d6a5b67ecd3b36'
+               '92ddbd7f2d778b8c9803aee328091b58fab324e4fad675945585808b4831d7bc'
+               '3ff4def08e4b7a9de576d26586cec64b6116')
+    aead_tag = '1ae10b594f09e26a7e902ecbd0600691'
+    otk = bytes(TOOLS.chacha20_keystream(aead_key, aead_nonce, counter=0, nbytes=32)[0])
+    body = bytes(TOOLS.chacha20_keystream(aead_key, aead_nonce, counter=1,
+                                          nbytes=len(aead_pt))[0])
+    our_ct = bytes(x ^ y for x, y in zip(aead_pt, body))
+    our_tag = TOOLS.poly1305_tag(otk, aead_aad, our_ct)
+    check('ChaCha20-Poly1305 RFC8439 §2.8.2',
+          our_ct.hex() == aead_ct and our_tag.hex() == aead_tag, our_tag.hex())
+
+    # --- MD5 length-extension：原消息长度取 MD5 padding 边界 ---
+    md5_ok = True
+    for orig_len in (0, 55, 56, 63, 64, 120):
+        msg = bytes((i * 37 + 11) & 0xFF for i in range(orig_len))
+        glue, new = EXT.hash_extend('md5', orig_len, hashlib.md5(msg).hexdigest(),
+                                    b'&admin=1')
+        if new != hashlib.md5(msg + glue + b'&admin=1').digest():
+            md5_ok = False
+            break
+    check('MD5 长度扩展边界(0/55/56/63/64/120)', md5_ok)
+
+    # --- SHA-1 length-extension：同一组 padding 边界 ---
+    sha1_ok = True
+    for orig_len in (0, 55, 56, 63, 64, 120):
+        msg = bytes((i * 53 + 7) & 0xFF for i in range(orig_len))
+        glue, new = EXT.hash_extend('sha1', orig_len, hashlib.sha1(msg).hexdigest(),
+                                    b'&admin=1')
+        if new != hashlib.sha1(msg + glue + b'&admin=1').digest():
+            sha1_ok = False
+            break
+    check('SHA-1 长度扩展边界(0/55/56/63/64/120)', sha1_ok)
+
+
 # ---------------------------------------------------------------- main
 def test_fuzz(n):
     """随机输入对拍：固定向量覆盖标准值，这里补边界（随机密钥长度 / 块 / nonce）。"""
@@ -407,12 +569,25 @@ def main(argv=None):
     test_rs()
     test_lcg()
     test_misc_crypto()
+    base_total = len(RESULTS)               # 原有固定向量（v3.1 基线 32 项）
+    test_known_vectors_extra()              # v3.2 增补固定向量（单独计数）
+    n_fixed_new = len(RESULTS) - base_total
+    n_fuzz = 0
     if fuzz:
+        before_fuzz = len(RESULTS)
         test_fuzz(fuzz)
+        n_fuzz = len(RESULTS) - before_fuzz
 
     npass = sum(1 for _, ok, _ in RESULTS if ok)
     print('=' * 60)
     print(f'通过 {npass}/{len(RESULTS)}')
+    if n_fixed_new or n_fuzz:
+        parts = [f'原有 {base_total}']
+        if n_fixed_new:
+            parts.append(f'新增固定向量 {n_fixed_new}')
+        if n_fuzz:
+            parts.append(f'随机对拍 {n_fuzz}')
+        print('  构成: ' + ' + '.join(parts))
     if npass != len(RESULTS):
         print('失败项:')
         for name, ok, d in RESULTS:

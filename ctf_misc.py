@@ -21,7 +21,8 @@ ctf_misc.py — 取证（图片/文件层）与 Pwn 辅助工具集（纯 CPU，
 退出码
 ------
   0  成功（没找到/无可疑数据也是 0，看输出）
-  1  运行期错误（文件不存在、图像非法、非 ELF、参数越界等；stderr 一行 "[cmd] 错误: ..."，无 traceback）
+  1  参数/运行期错误（文件不存在、图像非法、非 ELF、参数越界或非法等；
+     stderr 一行 "[cmd] 错误: ..."，无 traceback；参数解析错误同样是 1，不是 argparse 默认的 2）
 
 用法
 ----
@@ -95,10 +96,115 @@ MAGICS = {
 }
 
 PNG_SIG = b'\x89PNG\r\n\x1a\n'
+# _grade 里 flag 特征的扫描窗口。原来的 256B 太短：隐写消息只要带一点二进制前缀
+# （长度头/盐值/分块写入）就会把明显的 flag 判成 0 分、完全不输出。
+_FLAG_SCAN = 1 << 16
+_FLAG_RE = re.compile(rb'(flag|ctf|gylike|EAI|DASCTF|NSSCTF)\{', re.I)
+
+
+def _valid_bmp(data: bytes, off: int) -> bool:
+    """校验 BMP 头：过滤文本/随机数据里 2 字节 'BM' 的高频误报。"""
+    n = len(data)
+    if off + 26 > n:
+        return False
+    size, r1, r2, pixoff = struct.unpack_from('<IHHI', data, off + 2)
+    if r1 or r2:                     # 两个 reserved 字段按规范必须为 0
+        return False
+    dib = struct.unpack_from('<I', data, off + 14)[0]
+    if dib not in (12, 40, 52, 56, 64, 108, 124):
+        return False
+    remain = n - off
+    if not 14 <= pixoff <= remain:   # 像素数据偏移必须落在文件内
+        return False
+    if size and not 26 <= size <= remain:   # 文件大小字段要么 0 要么合理
+        return False
+    return True
+
+
+def _valid_ico(data: bytes, off: int) -> bool:
+    """校验 ICO 目录项：过滤二进制里常见的 00 00 01 00 误报。"""
+    n = len(data)
+    if off + 6 > n:
+        return False
+    count = struct.unpack_from('<H', data, off + 4)[0]
+    if not 1 <= count <= 64:
+        return False
+    ent = off + 6
+    if ent + 16 * count > n:
+        return False
+    head_size = 6 + 16 * count
+    for i in range(count):
+        e = ent + 16 * i
+        if data[e + 3] != 0:         # 目录项 reserved 必须为 0
+            return False
+        size, imgoff = struct.unpack_from('<II', data, e + 8)
+        if size == 0 or not head_size <= imgoff < n - off:
+            return False
+    return True
+
+
+def _valid_zlib(data: bytes, off: int) -> bool:
+    """校验 78 xx 是真的 zlib 流（2 字节头在随机数据里约 3/65536 命中）。"""
+    if len(data) - off < 2:
+        return False
+    # PNG 的 IDAT 被拆成多个 chunk 时 zlib 流在文件里不连续，解压器会报错；
+    # 但紧跟在 IDAT 类型后的数据就是合法的 zlib 流起点（O(1) 判定，不遍历 chunk）。
+    if off >= 8 and data[off - 4:off] == b'IDAT' and data.startswith(PNG_SIG):
+        return True
+    try:
+        zlib.decompressobj().decompress(data[off:off + 4096])
+    except Exception:
+        return False
+    return True
+
+
+def _valid_gzip(data: bytes, off: int) -> bool:
+    """gzip 头 3 字节在压缩数据里会误报：校验 FLG 保留位并试解压。"""
+    if len(data) - off < 10:
+        return False
+    if data[off + 3] & 0xE0:                      # FLG 保留位必须为 0
+        return False
+    try:
+        zlib.decompressobj(16 + zlib.MAX_WBITS).decompress(data[off:off + 4096])
+    except Exception:
+        return False
+    return True
+
+
+def _valid_bzip2(data: bytes, off: int) -> bool:
+    """BZh 后必须是压缩级别 + bzip2 块/EOS 魔数（0x314159265359 / 0x177245385090）。"""
+    if len(data) - off < 10:
+        return False
+    if data[off + 3] not in b'123456789':
+        return False
+    return data[off + 4:off + 10] in (b'\x31\x41\x59\x26\x53\x59',
+                                      b'\x17\x72\x45\x38\x50\x90')
+
+
+_MAGIC_VALIDATORS = {
+    b'BM': _valid_bmp,
+    b'\x00\x00\x01\x00': _valid_ico,
+    b'\x78\x9c': _valid_zlib,
+    b'\x78\xda': _valid_zlib,
+    b'\x78\x01': _valid_zlib,
+    b'\x1f\x8b\x08': _valid_gzip,
+    b'BZh': _valid_bzip2,
+}
+
+
+def _magic_ok(m: bytes, data: bytes, off: int) -> bool:
+    """短 magic 需要格式校验；其余 magic 直接算命中。"""
+    fn = _MAGIC_VALIDATORS.get(m)
+    return True if fn is None else fn(data, off)
 
 
 def find_magics(data: bytes, min_gap=0):
-    """扫描数据里的已知 magic，返回 [(offset, name)]。"""
+    """扫描数据里的已知 magic，返回 [(offset, name)]。
+
+    2 字节短签名（BMP/zlib）与 ICO 会做格式校验，避免把普通文本/随机字节
+    误报成"内嵌文件"。min_gap > 0 时，距上一个保留命中不足 min_gap 字节的
+    命中会被丢弃（用于降噪）。
+    """
     hits = []
     for m, name in MAGICS.items():
         start = 0
@@ -106,28 +212,37 @@ def find_magics(data: bytes, min_gap=0):
             i = data.find(m, start)
             if i < 0:
                 break
-            hits.append((i, name))
             start = i + 1
+            if _magic_ok(m, data, i):
+                hits.append((i, name))
     hits.sort()
+    if min_gap > 0:
+        kept = []
+        last = None
+        for off, name in hits:
+            if last is not None and off - last < min_gap:
+                continue
+            kept.append((off, name))
+            last = off
+        hits = kept
     return hits
 
 
 def printable_runs(data: bytes, minlen=6):
-    """提取连续可打印字符串。"""
+    """提取连续可打印字符串（numpy 向量化：100MB 文件从数秒降到亚秒级）。"""
+    if not data:
+        return []
+    arr = np.frombuffer(data, dtype=np.uint8)
+    mask = ((arr >= 32) & (arr < 127)) | (arr == 9)
+    if not mask.any():
+        return []
+    d = np.diff(np.concatenate(([False], mask, [False])).astype(np.int8))
+    starts = np.flatnonzero(d == 1)
+    ends = np.flatnonzero(d == -1)
     out = []
-    cur = bytearray()
-    pos = 0
-    for i, b in enumerate(data):
-        if 32 <= b < 127 or b in (9,):
-            if not cur:
-                pos = i
-            cur.append(b)
-        else:
-            if len(cur) >= minlen:
-                out.append((pos, bytes(cur)))
-            cur = bytearray()
-    if len(cur) >= minlen:
-        out.append((pos, bytes(cur)))
+    for s, e in zip(starts, ends):
+        if e - s >= minlen:
+            out.append((int(s), bytes(data[int(s):int(e)])))
     return out
 
 
@@ -157,68 +272,94 @@ def lsb_bits(img, channels=(0, 1, 2), bit=0, col_major=False, interleave=False):
     order = [ch for ch in channels if 0 <= ch < c]
     if not order:
         return np.zeros(0, dtype=np.uint8)
-    sub = a[:, :, order]
+    # 整通道集直接用视图，避免 fancy-index 复制整张大图
+    sub = a if order == list(range(c)) else a[:, :, order]
     if interleave:
         # 行优先：y, x, ch ；列优先：x, y, ch
         q = sub.transpose(1, 0, 2) if col_major else sub
     else:
         # 行优先：ch, y, x ；列优先：ch, x, y
         q = sub.transpose(2, 1, 0) if col_major else sub.transpose(2, 0, 1)
-    return ((q >> bit) & 1).astype(np.uint8).ravel()
+    return np.asarray((q >> bit) & 1, dtype=np.uint8).ravel()
 
 
 def bits_to_bytes(bits, msb_first=True):
+    """把 0/1 比特流按 8 位打包成 bytes（numpy 向量化，避免大图 int64 临时数组）。"""
     n = (len(bits) // 8) * 8
     if n <= 0:
         return b''
     b = np.asarray(bits[:n], dtype=np.uint8).reshape(-1, 8)
-    if msb_first:
-        w = (1 << np.arange(7, -1, -1))
-    else:
-        w = (1 << np.arange(0, 8))
-    return (b * w).sum(1).astype(np.uint8).tobytes()
+    return np.packbits(b, axis=1, bitorder='big' if msb_first else 'little').tobytes()
 
 
 def _grade(raw: bytes):
     """给一段提取数据打分：magic > flag 特征 > 内嵌 magic > 可打印率。
 
     只把 >=3 字节的 magic 用于"内嵌偏移"打分：BMP('BM')、zlib('78 9c') 这类
-    2 字节 magic 在随机数据里命中率太高，会把真正的 flag 挤出结果。
+    2 字节 magic 在随机数据里命中率太高；它们即使出现在开头也先做格式校验。
+    flag 特征扫描前 64 KiB（而不是 256 B），带二进制前缀的消息不再被判 0 分。
     """
     for m, name in MAGICS.items():
-        if raw.startswith(m):
+        if raw.startswith(m) and _magic_ok(m, raw, 0):
             return 100, f'MAGIC {name}'
     # flag 特征优先于"偏移处 magic"，否则随机噪声里的 78 9c 会压过真 flag
-    if re.search(rb'(flag|ctf|gylike|EAI|DASCTF|NSSCTF)\{', raw[:256], re.I):
-        return 90, f'含 flag 特征 {raw[:48]!r}'
+    fm = _FLAG_RE.search(raw, 0, _FLAG_SCAN)
+    if fm:
+        off = fm.start()
+        if off == 0:
+            return 90, f'含 flag 特征 {raw[:48]!r}'
+        return 90, f'含 flag 特征 @+{off} {raw[off:off + 48]!r}'
     for m, name in MAGICS.items():
         if len(m) < 3:
             continue
         off = raw[:4096].find(m)
-        if 0 <= off < 256:
+        if 0 <= off < 256 and _magic_ok(m, raw, off):
             return 80, f'MAGIC {name} @+{off}'
     head = raw[:64]
     printable = bytes(b for b in head if 32 <= b < 127)
     if len(printable) >= 8 and len(printable) / len(head) > 0.6:
         return 40, f'前缀可打印 {printable[:24]!r}'
-    # 整体可打印率
-    txt = bytes(b for b in raw if 32 <= b < 127)
-    ratio = len(txt) / max(1, len(raw))
-    if ratio > 0.9 and len(txt) > 16:
+    # 整体可打印率（numpy 向量化：大图一次扫描要跑上百个组合）
+    if not raw:
+        return 0, ''
+    arr = np.frombuffer(raw, dtype=np.uint8)
+    txt_len = int(((arr >= 32) & (arr < 127)).sum())
+    if txt_len / len(raw) > 0.9 and txt_len > 16:
         if re.search(rb'(flag|ctf|gylike|\{|\})', raw, re.I):
             return 60, f'可打印(含 flag 特征) {raw[:32]!r}'
         return 20, f'可打印 {raw[:24]!r}'
     return 0, ''
 
 
+def _png_16bit_color_hint(path):
+    """PNG 16-bit 彩色/带 alpha 会被 Pillow 解码成 8-bit（低字节丢失），给出提示。"""
+    try:
+        with open(path, 'rb') as f:
+            head = f.read(33)
+    except OSError:
+        return None
+    if len(head) < 26 or head[:8] != PNG_SIG or head[12:16] != b'IHDR':
+        return None
+    bitdepth, colortype = head[24], head[25]
+    if bitdepth == 16 and colortype in (2, 4, 6):
+        return (f'PNG bit depth 16 + color type {colortype}：Pillow 解码会丢弃低字节，'
+                f'lsb 只能看到高 8 位（隐写在 bit0~7 时提不出来）')
+    return None
+
+
 def lsb_scan(path, max_report=8):
-    """穷举 (通道组合 × 位平面 × 行/列序 × 像素交织 × 位序)，找可识别内容。"""
+    """穷举 (通道组合 × 位平面 × 行/列序 × 像素交织 × 位序)，找可识别内容。
+
+    保留图像原生位深：16-bit 灰度不再被 convert('RGB') 压成 8-bit（那样会把
+    隐写用的低位直接丢掉）；只有浮点等无法做位运算的模式才转 RGB。
+    """
     img = Image.open(path)
     img.load()
-    if img.mode not in ('RGB', 'RGBA', 'L', 'P'):
+    arr = np.asarray(img)
+    if arr.dtype.kind not in 'uib':      # float/complex 无法做移位，转 RGB 后再扫
         img = img.convert('RGB')
-    a = np.asarray(img)
-    c = a.shape[2] if a.ndim == 3 else 1
+        arr = np.asarray(img)
+    c = arr.shape[2] if arr.ndim == 3 else 1
     chan_sets = [(0, 1, 2), (0,), (1,), (2,), (2, 1, 0), (0, 1, 2, 3), (3,)]
     results = []
     seen_keys = set()
@@ -229,7 +370,8 @@ def lsb_scan(path, max_report=8):
         seen_keys.add(eff)
         for bit in range(3):
             for col_major in (False, True):
-                for interleave in (False, True):
+                # 单通道图 seq 与 pix 的取值顺序完全相同，跳过重复组合
+                for interleave in ((False,) if c == 1 else (False, True)):
                     bits = lsb_bits(img, eff, bit, col_major, interleave)
                     for msb in (True, False):
                         raw = bits_to_bytes(bits, msb)
@@ -241,6 +383,9 @@ def lsb_scan(path, max_report=8):
                                             raw[:64], interleave))
     results.sort(key=lambda r: -r[0])
     print(f'[lsb] {path}  mode={img.mode} size={img.size}  命中 {len(results)} 组')
+    warn = _png_16bit_color_hint(path)
+    if warn:
+        print(f'  ⚠ {warn}')
     for score, chs, bit, cm, msb, info, head, il in results[:max_report]:
         order = 'col' if cm else 'row'
         mode = 'pix' if il else 'seq'
@@ -300,9 +445,9 @@ def stegscan(path):
     if data.startswith(b'\x89PNG'):
         chunks, iend_end, warns = _png_walk(data)
         if iend_end is None:
-            # 兜底：找最后一个完整的空 IEND chunk 签名
+            # 兜底：找最后一个完整的空 IEND chunk 签名（CRC 缺失即文件被截断，不能谎报 0 字节尾数据）
             j = data.rfind(b'\x00\x00\x00\x00IEND')
-            if j >= 0:
+            if 0 <= j and j + 12 <= len(data):
                 iend_end = j + 12
         if iend_end is not None:
             tail = data[iend_end:]
@@ -311,10 +456,8 @@ def stegscan(path):
             print(f'  PNG: IEND 之后还有 {len(tail)} 字节{tag}')
             if tail:
                 print(f'    尾部 head={tail[:48]!r}')
-                for m, n in MAGICS.items():
-                    j = tail.find(m)
-                    if j >= 0:
-                        print(f'    ★ 尾部 +{j} 处含 {n}')
+                for j, n in find_magics(tail):
+                    print(f'    ★ 尾部 +{j} 处含 {n}')
         else:
             print('  PNG: 未找到 IEND（文件可能被截断）')
         odd = [(t, l) for t, l, _ in chunks if t not in PNG_STANDARD_CHUNKS]
@@ -377,9 +520,9 @@ def imgdiff(pa, pb, out_path=None):
     print(f'[imgdiff] 差异像素 {len(ys)} / {diff.size}  最大差 {int(diff.max()) if diff.size else 0}')
     if len(ys):
         print(f'  包围盒 x[{xs.min()}..{xs.max()}] y[{ys.min()}..{ys.max()}]')
-    # 通道级 LSB 差异（隐写常见）
+    # 通道级 LSB 差异（隐写常见）：按"像素"计数（任一通道 LSB 不同即算一个像素）
     x = (a ^ b)
-    bitdiff = x & 1
+    bitdiff = (x & 1).any(axis=2)
     print(f'  LSB 层差异像素 {int(bitdiff.sum())}')
     if out_path:
         _ensure_parent(out_path)
@@ -447,7 +590,12 @@ def cyclic(length, alphabet=None, n=4):
         length = 0
     if length < 0:
         raise ValueError(f'--length 不能为负（得到 {length}）')
-    alpha = bytes(alphabet) if alphabet is not None else CYCLIC_ALPHABET
+    if not isinstance(n, int) or n < 1:
+        raise ValueError(f'n 必须 >= 1（得到 {n!r}）')
+    try:
+        alpha = bytes(alphabet) if alphabet is not None else CYCLIC_ALPHABET
+    except TypeError:
+        raise ValueError('alphabet 必须是 bytes（元素为 0..255 的字节串）') from None
     if len(alpha) < 2:
         raise ValueError('字母表至少需要 2 个字符')
     key = (alpha, n)
@@ -479,7 +627,7 @@ def cycfind(needle_hex, length=4096):
 # =====================================================================
 # Pwn：ROP gadget
 # =====================================================================
-GADGET_WINDOW = 32   # 只回溯结尾指令前 32 字节（与常见 gadget 长度匹配，控制大文件耗时）
+GADGET_WINDOW = 32   # 结尾指令之前最多回溯 32 字节（含结尾指令共 33~35 字节）
 
 
 def _terminator_len(data: bytes, pos: int) -> int:
@@ -505,6 +653,10 @@ def find_gadgets(path, flt=None, max_insn=6, bits=64, limit=40):
     if not HAS_CS:
         print('[gadgets] 未安装 capstone')
         return []
+    if bits not in (32, 64):
+        raise ValueError(f'--bits 只能是 32 或 64（得到 {bits}）')
+    if max_insn < 1:
+        raise ValueError(f'--max-insn 必须 >= 1（得到 {max_insn}）')
     data = open(path, 'rb').read()
     md = Cs(CS_ARCH_X86, CS_MODE_64 if bits == 64 else CS_MODE_32)
     md.detail = False
@@ -516,7 +668,8 @@ def find_gadgets(path, flt=None, max_insn=6, bits=64, limit=40):
         if not tlen:
             continue
         end = tpos + tlen
-        lo = max(0, end - GADGET_WINDOW)
+        # 窗口按"结尾指令之前的字节数"算：start >= tpos - 32，正好 32 字节也要包含
+        lo = max(0, tpos - GADGET_WINDOW)
         for start in range(tpos, lo - 1, -1):
             insns = list(md.disasm(data[start:end], start))
             if not insns:
@@ -579,8 +732,36 @@ def _elf_has_segment(elf, ptype):
     return None
 
 
+def _elf_truncation(elf, data):
+    """返回程序头/节头表越界描述；None 表示结构完整。
+
+    CLI_REFERENCE 约定"截断的 ELF 退出码 1"：pyelftools 很懒，只有真正访问到
+    越界结构时才报错，而各个解析分支又都做了容错，所以这里显式校验表边界。
+    """
+    n = len(data)
+    try:
+        phnum = elf['e_phnum']
+        phentsize = elf['e_phentsize']
+        phoff = elf['e_phoff']
+        shnum = elf['e_shnum']
+        shentsize = elf['e_shentsize']
+        shoff = elf['e_shoff']
+    except Exception:
+        return None
+    if phnum and phnum != 0xffff:      # 0xffff = PN_XNUM（扩展计数，极少见，交给 pyelftools）
+        if phentsize < 32 or phoff + phnum * phentsize > n:
+            return f'程序头表越界（phoff={phoff:#x} phnum={phnum} phentsize={phentsize}）'
+    if shnum:                          # e_shnum=0 可能是无节头，也可能是扩展计数
+        if shentsize < 40 or shoff + shnum * shentsize > n:
+            return f'节头表越界（shoff={shoff:#x} shnum={shnum} shentsize={shentsize}）'
+    return None
+
+
 def _elfinfo_report(path, data):
     elf = ELFFile(io.BytesIO(data))
+    trunc = _elf_truncation(elf, data)
+    if trunc:
+        raise ELFError(f'ELF 结构被截断：{trunc}')
     try:
         arch = elf.get_machine_arch()
     except Exception:
@@ -716,6 +897,39 @@ def cmd_selftest(a):
         if not il_ok:
             fails.append('[LSB 像素交织]')
 
+        # --- 16-bit 灰度 PNG：必须按原生位深提取，不能被 convert('RGB') 丢掉低位 ---
+        secret16 = b'flag{16bit_native}'
+        h16 = rng.integers(0, 65536, (32, 32), dtype=np.uint16)
+        bits16 = np.unpackbits(np.frombuffer(secret16, dtype=np.uint8))
+        flat16 = h16.reshape(-1).copy()
+        mask16 = np.array(np.iinfo(np.uint16).max - 1, dtype=np.uint16)
+        flat16[:len(bits16)] = (flat16[:len(bits16)] & mask16) | bits16.astype(np.uint16)
+        p16 = os.path.join(tmp, 'stego16.png')
+        Image.fromarray(flat16.reshape(32, 32)).save(p16)
+        res16 = lsb_scan(p16)
+        ok16 = any(secret16[:12] in x[6] for x in res16)
+        print(f'[LSB 16-bit 灰度] {"PASS" if ok16 else "FAIL"}'
+              f'  (mode={Image.open(p16).mode}, 命中 {len(res16)})')
+        if not ok16:
+            fails.append('[LSB 16-bit 灰度]')
+
+        # --- flag 前有 300B 二进制前缀：_grade 的 flag 扫描窗口不能只有 256B ---
+        deep = b'\x00' * 300 + b'flag{deep_offset}' + b'\x00' * 64
+        rgba_d = rng.integers(0, 256, (64, 64, 4), dtype=np.uint8)
+        dbits = np.unpackbits(np.frombuffer(deep, dtype=np.uint8))
+        dflat = rgba_d.reshape(-1).copy()
+        dpos = np.arange(0, 64 * 64 * 4, 4)          # R 通道，行优先
+        dn = min(len(dbits), len(dpos))
+        dflat[dpos[:dn]] = (dflat[dpos[:dn]] & 0xFE) | dbits[:dn]
+        pdeep = os.path.join(tmp, 'stego_deep.png')
+        Image.fromarray(dflat.reshape(64, 64, 4)).save(pdeep)
+        resdeep = lsb_scan(pdeep)
+        deep_ok = any('flag{deep_offset}' in x[5] for x in resdeep)
+        print(f'[LSB 深偏移 flag] {"PASS" if deep_ok else "FAIL"}'
+              f'  (前缀 300B, 命中 {len(resdeep)})')
+        if not deep_ok:
+            fails.append('[LSB 深偏移 flag]')
+
         # --- 尾附加数据扫描（PNG IEND 之后 36 字节，含 ZIP magic）---
         p2 = os.path.join(tmp, 'trail.png')
         base = open(p1, 'rb').read()
@@ -745,6 +959,17 @@ def cmd_selftest(a):
         print(f'[cycfind 偏移 0] {"PASS" if i0 == 0 else "FAIL"}  (期望 0, 得到 {i0})')
         if i0 != 0:
             fails.append('[cycfind 偏移 0]')
+        # --- de Bruijn 独立已知向量（FKM 二进制/三进制参考值）+ n 合法性校验 ---
+        db_ok = (_de_bruijn(b'01', 3) == b'00010111'
+                 and _de_bruijn(b'abc', 2) == b'aabacbbcc')
+        try:
+            cyclic(10, b'ab', 0)
+            n_bad = False
+        except ValueError:
+            n_bad = True
+        print(f'[de Bruijn 独立向量/n 校验] {"PASS" if (db_ok and n_bad) else "FAIL"}')
+        if not (db_ok and n_bad):
+            fails.append('[de Bruijn 独立向量/n 校验]')
 
         # --- gadget 搜索：手工构造 "pop rdi ; ret" + 裸 ret/retf/syscall ---
         p3 = os.path.join(tmp, 'blob.bin')
@@ -764,8 +989,78 @@ def cmd_selftest(a):
         if not term_ok:
             fails.append('[gadget 裸结尾指令]')
 
-        # --- ELF 信息：这里没有真实 ELF，跳过真实 ELF 用例，只测非 ELF 的干净失败路径 ---
-        print('[elfinfo] 跳过真实 ELF（本机无 /usr/bin/ls），改测非 ELF 容错')
+        # --- gadget 回溯窗口 = 结尾指令前 32 字节（正好 32 字节必须包含，33 字节必须排除）---
+        p6 = os.path.join(tmp, 'win32.bin')
+        open(p6, 'wb').write(b'\x90' * 32 + b'\xc3')
+        gw = find_gadgets(p6, flt=None, max_insn=40, limit=1)
+        win_ok = any(a == 0 for a, _ in gw)
+        open(p6, 'wb').write(b'\x90' * 33 + b'\xc3')
+        gw2 = find_gadgets(p6, flt=None, max_insn=40, limit=1)
+        win_ok = win_ok and (not any(a == 0 for a, _ in gw2))
+        print(f'[gadget 32B 回溯窗口] {"PASS" if win_ok else "FAIL"}')
+        if not win_ok:
+            fails.append('[gadget 32B 回溯窗口]')
+        # --- gadgets 参数校验：--bits / --max-insn 非法值干净报错 ---
+        bad_param = 0
+        for kw in ({'bits': 16}, {'max_insn': 0}):
+            try:
+                find_gadgets(p4, **kw)
+            except ValueError:
+                bad_param += 1
+        print(f'[gadgets 参数校验] {"PASS" if bad_param == 2 else "FAIL"}')
+        if bad_param != 2:
+            fails.append('[gadgets 参数校验]')
+
+        # --- ELF 信息：本机无真实 ELF，手工构造最小 ELF64（无节头）做保护解析回归 ---
+        def _stub_elf64(truncate=0):
+            interp = b'/lib64/ld-linux-x86-64.so.2\x00'
+            phnum, phoff = 5, 64
+            interp_off = 64 + phnum * 56
+            dyn_off = (interp_off + len(interp) + 7) // 8 * 8
+            dynstr_off = dyn_off + 48                    # 3 个 dynamic tag
+            # DT_STRTAB 指向文件内 dynstr（无节头时 pyelftools 靠它建字符串表）；
+            # DT_BIND_NOW 让 RELRO 判 Full；PT_GNU_STACK RW 让 NX 判"是"。
+            dyn = (struct.pack('<qQ', 5, 0x400000 + dynstr_off)
+                   + struct.pack('<qQ', 24, 0)
+                   + struct.pack('<qQ', 0, 0))
+            filesz = dynstr_off + 1
+
+            def ph(t, flags, off, va, sz, al=0x1000):
+                return struct.pack('<IIQQQQQQ', t, flags, off, va, 0x400000, sz, sz, al)
+            phdrs = (ph(1, 5, 0, 0x400000, filesz)                          # PT_LOAD
+                     + ph(3, 4, interp_off, 0x400000 + interp_off, len(interp), 1)
+                     + ph(0x6474e551, 6, 0, 0, 0, 16)                       # PT_GNU_STACK RW
+                     + ph(0x6474e552, 4, dyn_off, 0x403000, 8, 1)           # PT_GNU_RELRO
+                     + ph(2, 6, dyn_off, 0x403040, len(dyn), 8))            # PT_DYNAMIC
+            ident = b'\x7fELF' + bytes([2, 1, 1, 0]) + b'\x00' * 8
+            hdr = ident + struct.pack('<HHIQQQIHHHHHH', 3, 62, 1, 0x401000, phoff, 0,
+                                      0, 64, 56, phnum, 64, 0, 0)
+            data = bytearray(hdr + phdrs)
+            for _pos, _blob in ((interp_off, interp), (dyn_off, dyn), (dynstr_off, b'\x00')):
+                if len(data) < _pos:
+                    data.extend(b'\x00' * (_pos - len(data)))
+                data[_pos:_pos + len(_blob)] = _blob
+            return bytes(data[:len(data) - truncate]) if truncate else bytes(data)
+
+        print('[elfinfo] 本机无真实 ELF，改用手工构造的最小 ELF64 做保护/截断回归')
+        p5 = os.path.join(tmp, 'stub.elf')
+        open(p5, 'wb').write(_stub_elf64())
+        ebuf = io.StringIO()
+        with contextlib.redirect_stdout(ebuf):
+            rc_stub = elfinfo(p5)
+        out_stub = ebuf.getvalue()
+        stub_ok = (rc_stub == 0 and 'NX: 是' in out_stub and 'PIE: 是' in out_stub
+                   and 'RELRO(Full): 是' in out_stub)
+        print(f'[elfinfo 最小 ELF64 保护解析] {"PASS" if stub_ok else "FAIL"}  (rc={rc_stub})')
+        if not stub_ok:
+            fails.append('[elfinfo 最小 ELF64 保护解析]')
+        ptr = os.path.join(tmp, 'stub_trunc.elf')
+        open(ptr, 'wb').write(_stub_elf64(truncate=200))
+        with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
+            rc_trunc = elfinfo(ptr)
+        print(f'[elfinfo 截断 ELF 容错] {"PASS" if rc_trunc == 1 else "FAIL"}  (rc={rc_trunc})')
+        if rc_trunc != 1:
+            fails.append('[elfinfo 截断 ELF 容错]')
         p5 = os.path.join(tmp, 'not_elf.bin')
         open(p5, 'wb').write(b'not an elf file at all\n' * 4)
         with contextlib.redirect_stderr(io.StringIO()):
@@ -773,6 +1068,74 @@ def cmd_selftest(a):
         print(f'[elfinfo 非 ELF 容错] {"PASS" if rc_elf == 1 else "FAIL"}  (rc={rc_elf})')
         if rc_elf != 1:
             fails.append('[elfinfo 非 ELF 容错]')
+
+        # --- imgdiff：LSB 层差异按"像素"计数（不是按通道值）---
+        ia = rng.integers(0, 256, (8, 8, 3), dtype=np.uint8)
+        ib = ia.copy()
+        ib[1, 2] = (ib[1, 2] + 1) & 0xFF
+        pia, pib = os.path.join(tmp, 'ia.png'), os.path.join(tmp, 'ib.png')
+        Image.fromarray(ia).save(pia)
+        Image.fromarray(ib).save(pib)
+        ibuf = io.StringIO()
+        with contextlib.redirect_stdout(ibuf):
+            imgdiff(pia, pib)
+        diff_ok = 'LSB 层差异像素 1' in ibuf.getvalue()
+        print(f'[imgdiff LSB 像素计数] {"PASS" if diff_ok else "FAIL"}')
+        if not diff_ok:
+            fails.append('[imgdiff LSB 像素计数]')
+
+        # --- 短 magic 校验：文本 'BM' 不再误报 BMP；真实 zlib/gzip/bzip2 流仍能识别 ---
+        import bz2
+        import gzip
+        fp = find_magics(b'BMW cars and BM things\n' * 3)
+        fake_gz = find_magics(b'\x1f\x8b\x08\xe5' + b'\x00' * 8)      # FLG 保留位非 0
+        z_ok = any(o == 0 and n == 'zlib(78 9c)' for o, n in find_magics(zlib.compress(b'hello world' * 10)))
+        gz_ok = find_magics(gzip.compress(b'hello')) == [(0, 'GZIP')]
+        bz_ok = find_magics(bz2.compress(b'hello')) == [(0, 'BZIP2')]
+        magic_ok = (not fp and not fake_gz and z_ok and gz_ok and bz_ok)
+        print(f'[magic 短签名误报抑制] {"PASS" if magic_ok else "FAIL"}  (误报 {fp[:3]} {fake_gz[:2]})')
+        if not magic_ok:
+            fails.append('[magic 短签名误报抑制]')
+
+        # --- printable_runs 偏移/最小长度（numpy 向量化回归）---
+        pr = printable_runs(b'\x00\x01hello world\x00\x02ab\x03flag{abc}\xff\tTAB\t\x00end', 6)
+        pr_ok = pr == [(2, b'hello world'), (18, b'flag{abc}')]
+        print(f'[printable_runs 偏移] {"PASS" if pr_ok else "FAIL"}  {pr}')
+        if not pr_ok:
+            fails.append('[printable_runs 偏移]')
+
+        # --- PNG IEND CRC 被截断：必须报"未找到 IEND"，不能谎报 0 字节尾数据 ---
+        pcut = os.path.join(tmp, 'iend_nocrc.png')
+        open(pcut, 'wb').write(base[:-4])
+        cbuf = io.StringIO()
+        with contextlib.redirect_stdout(cbuf):
+            cinfo = stegscan(pcut)
+        cut_ok = cinfo.get('png_tail') is None and '未找到 IEND' in cbuf.getvalue()
+        print(f'[PNG IEND 截断容错] {"PASS" if cut_ok else "FAIL"}')
+        if not cut_ok:
+            fails.append('[PNG IEND 截断容错]')
+
+        # --- bits_to_bytes 打包（MSB/LSB 位序）---
+        pack_ok = (bits_to_bytes([1, 0, 0, 0, 0, 0, 0, 0], True) == b'\x80'
+                   and bits_to_bytes([1, 0, 0, 0, 0, 0, 0, 0], False) == b'\x01')
+        print(f'[bits_to_bytes 位序] {"PASS" if pack_ok else "FAIL"}')
+        if not pack_ok:
+            fails.append('[bits_to_bytes 位序]')
+
+        # --- CLI 参数解析错误退出码 = 1（CLI_REFERENCE §6，不是 argparse 默认的 2）---
+        argv_bak = sys.argv
+        sys.argv = ['ctf_misc.py', 'gadgets', '--file', 'x', '--bits', '16']
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                main()
+            cli_rc = None
+        except SystemExit as e:
+            cli_rc = e.code
+        finally:
+            sys.argv = argv_bak
+        print(f'[CLI 参数错误退出码] {"PASS" if cli_rc == 1 else "FAIL"}  (rc={cli_rc})')
+        if cli_rc != 1:
+            fails.append('[CLI 参数错误退出码]')
 
         # --- 参数校验：bitplane 越界应给出干净错误 ---
         try:
@@ -800,8 +1163,17 @@ def _cmd_cycfind(a):
     return None
 
 
+class _MiscArgumentParser(argparse.ArgumentParser):
+    """参数错误统一返回退出码 1（argparse 默认 2；CLI_REFERENCE §6 规定 ctf_misc 为 1）。"""
+
+    def error(self, message):
+        self.print_usage(sys.stderr)
+        print(f'[ctf_misc] 错误: {message}', file=sys.stderr)
+        raise SystemExit(1)
+
+
 def main():
-    ap = argparse.ArgumentParser(
+    ap = _MiscArgumentParser(
         description='ctf_misc — 取证与 Pwn 辅助（纯 CPU；完整说明见 CLI_REFERENCE.md）')
     sub = ap.add_subparsers(dest='cmd', required=True,
                             metavar='{selftest,lsb,stegscan,imgdiff,bitplane,cyclic,cycfind,gadgets,elfinfo}')

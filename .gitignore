@@ -5,6 +5,8 @@ __pycache__/
 .venv/
 venv/
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
 
 # OS / editor
 Thumbs.db
@@ -12,4 +14,8 @@ Thumbs.db
 *.log
 *.tmp
 
+# 生成物（examples/out 由 make_examples.py 生成）
 examples/out/
+
+# 改进过程的审计报告（工作产物，不入库）
+reports/

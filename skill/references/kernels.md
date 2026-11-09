@@ -1,11 +1,12 @@
-﻿# 内核速查表（一页版）
+# 内核速查表（一页版）
 
 | 文档属性 | 值 |
 |---|---|
-| 文档版本 | v3.1（2026-11-09） |
+| 文档版本 | v3.2（2026-11-09） |
 | 定位 | **选型速查**：题型 → 内核 → 验证向量 → 吞吐。完整参数/输出/退出码以仓库根 `CLI_REFERENCE.md` 为准 |
 | 环境 | 仓库根目录；解释器 PATH 上的 `python3`/`python`（需 torch 2.14.1+cu130 才有 GPU，否则自动回落 numpy） |
 | 性能口径 | RTX 5070 Laptop 8 GB 本机复测；随驱动/温度波动 2~3 倍，先跑 `bench` |
+| 验证入口 | 改代码后跑 `python -X utf8 verify_all.py`（六层：doc_lint / 模块自测 / 主框架自测 / consistency / fuzz_kernels / 统一入口+示例） |
 
 ## 1. 题型 → 内核 决策表
 
@@ -44,7 +45,7 @@
 
 | 内核 | 用途 | 关键输入 | 验证向量 | 吞吐（本机） |
 |---|---|---|---|---|
-| `mt19937_keys` / `mtscan` | 种子 → 24B 密钥 | 24B 目标 hex；`--twist` | 纯 Python MT 参考（twist 0/1） | ~35 M 种子/s（bench）；端到端 ~9 M/s |
+| `mt19937_keys` / `mtscan` | 种子 → 24B 密钥 | 24B 目标 hex；`--twist`；库 API `nbytes=` 按需截断 | 纯 Python MT 参考（twist 0/1） | ~30 M 种子/s（bench，24B）；12B ~62 M/s；mtscan 端到端 3M 8.2 M/s / 10M 20.5 M/s |
 | `aes192_ecb` / `sboxscan` | 批量 AES-192 单块 / 故障枚举 | 明文/密文/24B key | NIST AES-192 向量 | ~1.6 M 块/s；65,280 组合 ≈ 0.4 s |
 | `popcount_matrix` / `ksscore` | 比特一致度 | 目标密钥流 | 与逐位 popcount 参考一致 | ~900 M/s |
 | `bit_agreement` | 候选 vs 目标打分 | `[N,L]` 候选 | torch == numpy | 随 GPU |
@@ -66,7 +67,7 @@
 | 内核 | 用途 | 验证向量 | 备注 |
 |---|---|---|---|
 | `tea_encrypt_block` / `xtea_*` / `xxtea_*` / `tea` | TEA 家族 | TEA(0,0,zero key)=`41ea3a0a94baa940`；多组往返；XXTEA 多长度 | 输出小端；key 必须 16B |
-| `speck_encrypt/decrypt` / `speck` | Speck | NSA：`a86842f2`、`8c6fa548454e028b` | NSA 组合 16/4、32/3、32/4 |
+| `speck_encrypt/decrypt` / `speck` | Speck | NSA：`a86842f2`（32/64）、`8c6fa548454e028b`（64/128）、`a65d9851797832657860fedf5c570d18`（128/128） | `--word-bits 16/32/64`；NSA 组合 16/4、32/3、32/4、64/2、64/3、64/4 |
 | `rc4` | RC4 | "Key"/"Plaintext"→`bbf316e8d940af0ad3` | key 1~256B |
 | `lcg_recover` / `lcg_predict` / `lcg` | LCG | 1103515245/12345 恢复并预测 | ≥3 个连续输出 |
 | `md5_batch` / `md5_crack` / `md5` | MD5 | "abc"→`900150983cd24fb0d6963f7d28e17f72` | 含空口令 |

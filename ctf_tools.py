@@ -13,12 +13,16 @@ ctf_tools.py — CTF 常用密码学内核（与 gpu_crack.py 共用后端）
   crc32     CRC32 批量计算 / 尾部 1~2 字节爆破匹配
   xorbrute  1~3 字节重复 XOR 爆破，按词频 + flag 结构打分
   aesctr    AES-192 CTR 密钥流 / 加解密
-  selftest  已知向量自测（9 项；全 PASS 退出码 0，失败 1）
+  selftest  已知向量自测（13 项；全 PASS 退出码 0，失败 1）
 
 全局参数（必须写在子命令之前）
 ------------------------------
   --backend {auto,torch,numpy}   默认 auto
-  --chunk N                      每批候选数，默认 16384（chacha --brute 用）
+  --chunk N                      每批候选数 / 断点粒度，默认 16384（chacha --brute、xorbrute 用）
+  --checkpoint FILE              断点文件（chacha --brute、xorbrute 支持续跑）
+  --reset-checkpoint             忽略已有断点
+  --json                         结果行改为单行 JSON 事件（stdout 只有事件）
+  --quiet / --no-progress        抑制横幅与进度/ETA（结果仍输出）
 
 输入约定
 --------
@@ -43,6 +47,7 @@ ctf_tools.py — CTF 常用密码学内核（与 gpu_crack.py 共用后端）
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
 import sys
 import time
@@ -85,9 +90,10 @@ def _parse_hex(s, name='hex'):
 
 
 def _load_keys_file(path, key_len):
-    """读取密钥文件：每行一个 hex 密钥；支持 0x 前缀、空行、# 注释行。"""
+    """读取密钥文件：每行一个 hex 密钥；支持 0x 前缀、空行、# 注释行、UTF-8 BOM。"""
     try:
-        with open(path, 'r', encoding='utf-8', errors='replace') as f:
+        # utf-8-sig：Windows 记事本/Excel 导出的文件常带 BOM，不剥掉会把首行密钥弄坏
+        with open(path, 'r', encoding='utf-8-sig', errors='replace') as f:
             lines = f.read().splitlines()
     except OSError as e:
         raise ValueError(f'无法读取密钥文件 {path}: {e}')
@@ -108,6 +114,24 @@ def _load_keys_file(path, key_len):
     if not keys:
         raise ValueError(f'{path} 中没有任何密钥')
     return np.array(keys, dtype=np.uint8)
+
+
+# ---------------------------------------------------------------- 输出（JSON 契约）
+# 文本模式保留原有中文文案；--json 模式只往 stdout 写单行 JSON 事件
+# （event=result|hit|error，kind=子命令名），进度/横幅仍走 stderr。
+def _json_result(kind, **fields):
+    """--json 模式输出一条 result 事件（文本模式请调用方 print 原本文案）。"""
+    C.emit({'event': 'result', 'kind': kind, **fields})
+
+
+def _json_hit(kind, **fields):
+    """--json 模式输出一条 hit 事件（★ 命中行）。"""
+    C.emit({'event': 'hit', 'kind': kind, **fields})
+
+
+def _json_locate(kind, **fields):
+    """--json 模式输出一条 locate 事件（纠错定位结果）。"""
+    C.emit({'event': 'locate', 'kind': kind, **fields})
 
 
 # =====================================================================
@@ -231,6 +255,49 @@ def chacha20_keystream(keys, nonce, counter=0, nbytes=64, rfc7539=None):
         outs.append(bs)
     out = T.cat(outs, dim=1) if is_t else np.concatenate(outs, axis=1)
     return G.from_dev(out)[:, :nbytes].astype(np.uint8)   # 统一返回 numpy
+
+
+def chacha_brute(nonce, counter, target, tries, rfc7539, chunk=1 << 14, checkpoint='',
+                 reset=False, progress=True, seed=1):
+    """ChaCha20 随机密钥搜索演示（不保证可复现，仅演示吞吐）。
+
+    按块调度（ctf_common.chunked）：--chunk 为每块候选数，--checkpoint 可续跑；
+    进度/ETA 只写 stderr（--quiet / --no-progress 可关），不污染 stdout 结果流。
+    返回 (done, hits, seconds)，hits 为 hit 事件 dict（index/key）。
+    """
+    tries, chunk = int(tries), int(chunk)
+    if chunk < 1:
+        raise ValueError(f'--chunk 必须 >= 1（chunk={chunk}）')
+    if tries < 1:
+        raise ValueError(f'--tries 必须 >= 1（tries={tries}）')
+    target_t = np.frombuffer(bytes(target), dtype=np.uint8)
+    rng = np.random.default_rng(int(seed))
+
+    def fn(lo, hi):
+        n = hi - lo
+        keys = rng.integers(0, 256, (n, 32), dtype=np.uint8)
+        ks = chacha20_keystream(keys, nonce, counter, len(target_t), rfc7539)
+        eq = (ks == target_t).all(1)
+        got = [{'event': 'hit', 'kind': 'chacha', 'index': int(lo + i),
+                'key': keys[i].tobytes().hex()} for i in np.nonzero(eq)[0]]
+        return n, got
+
+    def on_hit(got):
+        return True                                    # 命中即早停
+
+    done, hits, dt = C.chunked(fn, tries, 0, chunk=chunk, label='chacha',
+                               checkpoint=checkpoint, reset=reset,
+                               progress=progress, on_hit=on_hit,
+                               # meta 指纹：不同 nonce/counter/目标长度/变体的任务不串用断点
+                               ckpt_meta={'cmd': 'chacha', 'nonce': bytes(nonce).hex(),
+                                          'counter': int(counter),
+                                          'target_len': int(len(target_t)),
+                                          'rfc7539': bool(rfc7539),
+                                          'target_sha': hashlib.sha256(
+                                              bytes(target_t)).hexdigest()[:16]})
+    # 断点文件可能来自别的命令/旧格式：只认本命令的 dict 事件
+    hits = [h for h in hits if isinstance(h, dict) and h.get('kind') == 'chacha']
+    return done, hits, dt
 
 
 # =====================================================================
@@ -501,10 +568,83 @@ def _score_plaintext(arr):
     return score
 
 
-def xorbrute(data, max_len=3, top=10):
+def _xor_split(g, max_len):
+    """全局候选序号 → (密钥长度, 该长度起始全局序号, 长度内密钥序号)。"""
+    base = 0
+    for klen in range(1, int(max_len) + 1):
+        total = 256 ** klen
+        if g < base + total:
+            return klen, base, g - base
+        base += total
+    raise ValueError(f'XOR 候选序号越界: {g}')
+
+
+def _xor_keys(klen, first, count):
+    """按大端密钥序号向量化生成 [count, klen] uint8 候选密钥。"""
+    keys = np.arange(int(first), int(first) + int(count), dtype=np.uint64)
+    return np.stack([(keys >> np.uint64(8 * (klen - 1 - i))) & np.uint64(0xFF)
+                     for i in range(klen)], axis=1).astype(np.uint8)
+
+
+class _XorScanner:
+    """重复 XOR 候选空间的确定性分块扫描器。
+
+    候选按「密钥长度段 + 段内固定批次」切批（批次大小只由内存决定，与 --chunk 无关），
+    跨块边界的不完整批次留到下一次 fn 调用凑满再打分。因此：
+      * 同一输入/参数下结果与 --chunk / --checkpoint 粒度无关（含并列分数的次序）；
+      * --chunk 只影响进度/断点落盘频率，不会拖慢内核（不会把批次切碎）。
     """
-    重复 XOR 爆破。data: bytes。返回 [(score, key_hex, plaintext), ...]
-    max_len 只支持 1~3：3 字节 = 1677 万候选（几秒），4 字节 = 43 亿，不可行。
+
+    def __init__(self, d, n, max_len, top):
+        self.d = d
+        self.n = int(n)
+        self.max_len = int(max_len)
+        self.top = int(top)
+        self.vec = max(1, 4_000_000 // max(1, self.n))   # 单批 4M 字节单元
+        self.pending = None                              # (klen, base, s, e)
+
+    def _score(self, klen, base, s, e):
+        cnt = e - s
+        kb = _xor_keys(klen, s - base, cnt)
+        ks = np.tile(kb, (1, (self.n + klen - 1) // klen))[:, :self.n]
+        pt = self.d[None, :] ^ ks
+        sc = _score_plaintext(pt)
+        m = min(self.top, int(sc.size))
+        idx = np.argsort(sc)[-m:][::-1]
+        return [{'event': 'hit', 'kind': 'xorbrute', 'score': int(sc[i]),
+                 'key': kb[i].tobytes().hex(),
+                 'plaintext': pt[i].tobytes().hex()} for i in idx]
+
+    def fn(self, lo, hi):
+        lo, hi = int(lo), int(hi)
+        got = []
+        pos = lo
+        if self.pending is not None:
+            klen, base, s, e = self.pending
+            if hi < e:                       # 批次还没凑满：等下一个块
+                return hi - lo, got
+            got += self._score(klen, base, s, e)
+            self.pending = None
+            pos = e
+        while pos < hi:
+            klen, base, _ = _xor_split(pos, self.max_len)
+            b_end = min(base + ((pos - base) // self.vec) * self.vec + self.vec,
+                        base + 256 ** klen)
+            if b_end <= hi:
+                got += self._score(klen, base, pos, b_end)
+                pos = b_end
+            else:                            # 余下的是不完整批次
+                self.pending = (klen, base, pos, b_end)
+                return hi - lo, got
+        return hi - lo, got
+
+
+def _xorbrute_scan(data, max_len=3, top=10, chunk=1 << 14, checkpoint='',
+                   reset=False, progress=True):
+    """重复 XOR 爆破（分块 + 断点续跑）；返回 (结果列表, 处理候选数, 秒数)。
+
+    候选空间按 1..max_len 字节密钥顺序编号为一个全局序列，因此断点文件里的 next
+    就是全局候选序号：中断后续跑不会重复扫描，也不会漏掉后面的密钥长度。
     """
     d = np.frombuffer(bytes(data), dtype=np.uint8)
     n = len(d)
@@ -515,29 +655,37 @@ def xorbrute(data, max_len=3, top=10):
         raise ValueError(f'max_len 只支持 1~3，收到 {max_len}')
     if top < 1:
         raise ValueError(f'top 必须 >= 1，收到 {top}')
-    results = []
-    for klen in range(1, max_len + 1):
-        total = 256 ** klen
-        keys = np.arange(total, dtype=np.uint64)
-        keybytes = np.stack([(keys >> np.uint64(8 * (klen - 1 - i))) & np.uint64(0xFF)
-                             for i in range(klen)], axis=1).astype(np.uint8)
-        step = max(1, 4_000_000 // max(1, n))
-        for s in range(0, total, step):
-            kb = keybytes[s:s + step]
-            ks = np.tile(kb, (1, (n + klen - 1) // klen))[:, :n]
-            pt = d[None, :] ^ ks
-            sc = _score_plaintext(pt)
-            idx = np.argsort(sc)[-top:][::-1]
-            for i in idx:
-                results.append((int(sc[i]), kb[i].tobytes().hex(), pt[i].tobytes()))
-    results.sort(key=lambda r: -r[0])
-    # 去重
-    seen, out = set(), []
-    for r in results:
-        if r[2] in seen:
+    chunk = int(chunk)
+    if chunk < 1:
+        raise ValueError(f'--chunk 必须 >= 1（chunk={chunk}）')
+    total = sum(256 ** k for k in range(1, max_len + 1))
+    scanner = _XorScanner(d, n, max_len, top)
+    done, hits, dt = C.chunked(
+        scanner.fn, total, 0, chunk=chunk, label='xorbrute',
+        checkpoint=checkpoint, reset=reset, progress=progress,
+        # meta 指纹：不同密文/密钥长度上限的任务不串用断点
+        ckpt_meta={'cmd': 'xorbrute', 'len': n, 'max_len': max_len,
+                   'data_sha': hashlib.sha256(d.tobytes()).hexdigest()[:16]})
+    hits = [h for h in hits if isinstance(h, dict) and h.get('kind') == 'xorbrute']
+    hits.sort(key=lambda h: -int(h['score']))
+    seen, out = set(), []                            # 按明文去重（与旧行为一致）
+    for h in hits:
+        pt = bytes.fromhex(h['plaintext'])
+        if pt in seen:
             continue
-        seen.add(r[2]); out.append(r)
-    return out[:top]
+        seen.add(pt)
+        out.append((int(h['score']), h['key'], pt))
+    return out[:top], done, dt
+
+
+def xorbrute(data, max_len=3, top=10):
+    """
+    重复 XOR 爆破。data: bytes。返回 [(score, key_hex, plaintext), ...]
+    max_len 只支持 1~3：3 字节 = 1677 万候选（几秒），4 字节 = 43 亿，不可行。
+    （分块/断点等调度参数由 _xorbrute_scan 提供，子命令走它。）
+    """
+    res, _, _ = _xorbrute_scan(data, max_len=max_len, top=top, progress=False)
+    return res
 
 
 # =====================================================================
@@ -677,6 +825,95 @@ def cmd_selftest(a):
     okx = bool(r) and b"Cooking MC's like a pound of bacon" in r[0][2]
     check('[xorbrute]', okx, f'  key={r[0][1]} → {r[0][2][:28]!r}' if r else '')
 
+    # --- AES-CTR nonce 模式（12B GCM 风格 / 16B 整块计数器；le 是自定义语义）---
+    # 期望值由独立实现生成：pycryptodome AES-ECB 逐块加密 + 显式拼装计数器块
+    k24 = bytes(range(24))
+    n12, n16 = bytes(range(12)), bytes(range(16))
+    ok_nm = (aesctr_keystream(k24, n12, 48, 5, 'le').hex() ==
+             '1b084ee09a83ecc1ebf4b2b3076abecf469cf1b0ed586b8b55b9ddde6971823d'
+             '402f743b7bb003a157da9557d2773ed2' and
+             aesctr_keystream(k24, n12, 48, 5, 'be').hex() ==
+             '7edada648641ceea4224d7afd8ae7607b69c09734999b440da3bb8fdf348d748'
+             '54c85ba1fe4582fecf898fe450222722' and
+             aesctr_keystream(k24, n16, 48, 5, 'le').hex() ==
+             '76f4db719a4144bee9a95172c17ac8e7ceb6f7c10531b64c29042960e794f3a3'
+             '9e83f0c83f2d50b802dbf891f2432a9b' and
+             aesctr_keystream(k24, n16, 48, 5, 'be').hex() ==
+             '152b8051a7ee48817db06421e9fbb99ed11579699aa331bd8ba7e2eadab94344'
+             '5a308e8a142bf9168728bb76d87a085a')
+    check('[AES-CTR nonce 模式]', ok_nm)
+
+    # --- 输入容错：带 UTF-8 BOM 的 keys-file（Windows 记事本导出）---
+    import contextlib
+    import io
+    import json as _json
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        kp = os.path.join(td, 'keys_bom.txt')
+        with open(kp, 'wb') as fh:
+            fh.write(b'\xef\xbb\xbf' + bytes(range(32)).hex().encode() + b'\r\n')
+        try:
+            kb = _load_keys_file(kp, 32)
+            ok_bom = kb.shape == (1, 32) and kb[0].tobytes() == bytes(range(32))
+        except ValueError:
+            ok_bom = False
+    check('[keys-file BOM 容错]', ok_bom)
+
+    # --- --json 契约：stdout 只有单行 JSON 事件（用 crc32 冒烟）---
+    saved_out = (C.json_mode(), C.quiet())
+    ok_json = False
+    buf = io.StringIO()
+    try:
+        C.set_output(json_mode=True, quiet=True)
+        with contextlib.redirect_stdout(buf):
+            cmd_crc32(argparse.Namespace(data_hex='313233343536373839', target_hex=None))
+        ev = _json.loads(buf.getvalue().strip())
+        ok_json = (ev.get('event') == 'result' and ev.get('kind') == 'crc32'
+                   and ev.get('crc') == 'cbf43926')
+    except Exception:
+        ok_json = False
+    finally:
+        C.set_output(json_mode=saved_out[0], quiet=saved_out[1])
+    check('[JSON 输出契约]', ok_json)
+
+    # --- 断点续跑（--checkpoint）：全局候选序号，中断后不重扫不漏扫 ---
+    ok_ck = True
+    with tempfile.TemporaryDirectory() as td:
+        try:
+            errbuf = io.StringIO()
+            with contextlib.redirect_stderr(errbuf):      # 续跑提示走 stderr，别刷屏
+                ck = os.path.join(td, 'ck_chacha.json')
+                far = bytes([0xFF] * 8)      # 4 个随机密钥几乎不可能命中 8B 目标
+                d1, _, _ = chacha_brute(bytes(8), 0, far, 4, False, chunk=2,
+                                        checkpoint=ck, progress=False)
+                with open(ck, encoding='utf-8') as fh:
+                    nxt = int(_json.load(fh).get('next', -1))
+                d2, _, _ = chacha_brute(bytes(8), 0, far, 4, False, chunk=2,
+                                        checkpoint=ck, progress=False)
+                with open(ck, 'w', encoding='utf-8') as fh:   # 模拟中途中断在 2/4
+                    _json.dump({'next': 2, 'hits': []}, fh)
+                d3, _, _ = chacha_brute(bytes(8), 0, far, 4, False, chunk=2,
+                                        checkpoint=ck, progress=False)
+                # 同一断点文件换目标：meta 指纹不一致 -> 告警并从头重扫（不能直接续到 end）
+                d4, _, _ = chacha_brute(bytes(8), 0, bytes([0xFE] * 8), 4, False, chunk=2,
+                                        checkpoint=ck, progress=False)
+                ckx = os.path.join(td, 'ck_xor.json')
+                r1, x1, _ = _xorbrute_scan(b'abc', 1, 3, chunk=64, checkpoint=ckx,
+                                           progress=False)
+                with open(ckx, 'w', encoding='utf-8') as fh:
+                    _json.dump({'next': 128, 'hits': []}, fh)
+                r2, x2, _ = _xorbrute_scan(b'abc', 1, 3, chunk=64, checkpoint=ckx,
+                                           progress=False)
+                _, x3, _ = _xorbrute_scan(b'abd', 1, 3, chunk=64, checkpoint=ckx,
+                                          progress=False)     # 换密文 -> 指纹不一致
+            ok_ck = (nxt == 4 and d1 == 4 and d2 == 0 and d3 == 2 and d4 == 4
+                     and x1 == 256 and x2 == 128 and x3 == 256 and r2
+                     # x2=128 且候选密钥序号都 >=128，证明是从断点位置续跑而非重扫
+                     and all(int(q[1], 16) >= 128 for q in r2))
+        except Exception:
+            ok_ck = False
+    check('[断点续跑]', ok_ck)
+
     # --- 性能 ---
     print('\n[性能]')
     keys = np.random.randint(0, 256, (1 << 14, 32), dtype=np.uint8)
@@ -703,19 +940,18 @@ def cmd_chacha(a):
     if a.key_len != 32:
         raise ValueError(f'ChaCha20 密钥固定 32 字节，--key-len 只支持 32，收到 {a.key_len}')
     rfc7539 = (len(nonce) == 12)
+    variant = 'rfc7539 12B nonce' if rfc7539 else '原版 8B nonce + 64bit 计数器'
     if a.keys_file:
         keys = _load_keys_file(a.keys_file, 32)
-        print(f'[scan] {len(keys)} 个候选密钥 × {len(target)}B 目标 '
-              f'（{"rfc7539 12B nonce" if rfc7539 else "原版 8B nonce + 64bit 计数器"}）')
+        if not C.json_mode():                     # 文本模式保留原起始行（结果流 stdout）
+            print(f'[scan] {len(keys)} 个候选密钥 × {len(target)}B 目标 （{variant}）')
         t0 = time.time()
         out = chacha20_keystream(keys, nonce, a.counter, len(target), rfc7539)
         eq = (out == np.frombuffer(target, dtype=np.uint8)).all(1)
         dt = time.time() - t0
-        print(f'[done] {len(keys)/dt/1e3:.1f} K/s')
-        for i in np.nonzero(eq)[0]:
-            print(f'  ★ 命中 #{i} key={keys[i].tobytes().hex()}')
-        if not eq.any():
-            best = None
+        hits = [int(i) for i in np.nonzero(eq)[0]]
+        best = None
+        if not hits:                              # 未命中：给出最接近的候选（比特一致度）
             target_t = np.frombuffer(target, dtype=np.uint8)
             for i in range(0, len(keys), 4096):
                 cand = (G.xp().tensor(out[i:i+4096], device=_dev()) if _is_torch()
@@ -727,30 +963,42 @@ def cmd_chacha(a):
                 j = int(np.argmax(sc))
                 if best is None or sc[j] > best[0]:
                     best = (int(sc[j]), i + j)
-            print(f'  未命中；最佳 {best[0]}/{len(target)*8} bit (候选 #{best[1]})')
+        rate = len(keys) / dt / 1e3 if dt else 0.0
+        if C.json_mode():
+            for i in hits:
+                _json_hit('chacha', index=i, key=keys[i].tobytes().hex())
+            payload = dict(mode='keys-file', candidates=len(keys), hit_count=len(hits),
+                           elapsed=round(dt, 4), rate_kps=round(rate, 2))
+            if best is not None:
+                payload['best'] = {'bits': best[0], 'total_bits': len(target) * 8,
+                                   'index': best[1]}
+            _json_result('chacha', **payload)
+        else:
+            print(f'[done] {rate:.1f} K/s')
+            for i in hits:
+                print(f'  ★ 命中 #{i} key={keys[i].tobytes().hex()}')
+            if best is not None:
+                print(f'  未命中；最佳 {best[0]}/{len(target)*8} bit (候选 #{best[1]})')
     elif a.brute:
-        print('[brute] 随机密钥搜索（仅为演示吞吐；真实场景用 --keys-file 或直接生成候选）')
-        rng = np.random.default_rng(1)
-        batch = int(a.chunk)
-        tries = int(a.tries)
-        if batch < 1 or tries < 1:
-            raise ValueError(f'--chunk/--tries 必须 >= 1（chunk={batch}, tries={tries}）')
-        total, found = 0, False
-        t0 = time.time()
-        target_t = np.frombuffer(target, dtype=np.uint8)
-        while total < tries:                       # 注意：这里永不全量扫 2^256，仅演示吞吐
-            n = min(batch, tries - total)
-            keys = rng.integers(0, 256, (n, 32), dtype=np.uint8)
-            out = chacha20_keystream(keys, nonce, a.counter, len(target), rfc7539)
-            if (out == target_t).all(1).any():
-                found = True
-                total += n
-                break
-            total += n
-            if total % (batch * 10) == 0:
-                print(f'  {total:,}  键/{(time.time()-t0):.1f}s', flush=True)
-        dt = time.time() - t0
-        print(f'[done] {total:,} 键 / {dt:.2f}s = {total/dt/1e3:.1f} K/s  {"命中" if found else "未命中"}')
+        if not C.json_mode():
+            print('[brute] 随机密钥搜索（仅为演示吞吐；真实场景用 --keys-file 或直接生成候选）')
+        done, hits, dt = chacha_brute(nonce, a.counter, target, a.tries, rfc7539,
+                                      chunk=a.chunk, checkpoint=a.checkpoint,
+                                      reset=a.reset_checkpoint,
+                                      progress=not a.no_progress)
+        found = bool(hits)
+        rate = done / dt / 1e3 if dt else 0.0
+        if C.json_mode():
+            for h in hits:
+                _json_hit('chacha', index=h.get('index'), key=h.get('key'))
+            _json_result('chacha', mode='brute', tried=done, found=found,
+                         hit_count=len(hits), elapsed=round(dt, 4),
+                         rate_kps=round(rate, 2))
+        else:
+            for h in hits:
+                print(f'  ★ 命中 #{h.get("index")} key={h.get("key")}')
+            print(f'[done] {done:,} 键 / {dt:.2f}s = {rate:.1f} K/s  '
+                  f'{"命中" if found else "未命中"}')
     else:
         raise ValueError('chacha 需要 --keys-file（候选密钥扫描）或 --brute（随机搜索演示）')
 
@@ -763,6 +1011,7 @@ def cmd_poly1305(a):
     msg = _parse_hex(a.msg_hex, '--msg-hex')
     aad = _parse_hex(a.aad_hex, '--aad-hex') if a.aad_hex else b''
     otk = key
+    otk_derived = False
     if a.nonce_hex is not None:
         if a.mode != 'aead':
             raise ValueError('--nonce-hex 只在 --mode aead 下使用')
@@ -771,20 +1020,33 @@ def cmd_poly1305(a):
             raise ValueError(f'AEAD nonce 需要 12 字节，收到 {len(nonce)} 字节')
         # 方便用法：给 ChaCha20 主密钥 + nonce，自动派生 Poly1305 子密钥（计数器 0 的前 32B）
         otk = bytes(chacha20_keystream(key, nonce, counter=0, nbytes=32)[0])
-        print(f'[poly1305] 派生 otk = {otk.hex()}')
+        otk_derived = True
+        if not C.json_mode():
+            print(f'[poly1305] 派生 otk = {otk.hex()}')
     if a.mode == 'aead':
         # aead 模式下 msg 按「密文」处理：tag 覆盖 pad(aad)||pad(ct)||len(aad)||len(ct)
         tag = poly1305_tag(otk, aad, msg)
     else:
         tag = poly1305(otk, msg)
-    print(f'[poly1305/{a.mode}] tag = {tag.hex()}')
+    fields = dict(mode=a.mode, tag=tag.hex())
+    if otk_derived:
+        fields['otk'] = otk.hex()
     if a.expect_hex:
         want = _parse_hex(a.expect_hex, '--expect-hex')
         if len(want) != 16:
             raise ValueError(f'--expect-hex 应为 16 字节 tag，收到 {len(want)} 字节')
         ok = tag == want
-        print(f'  期望 {want.hex()}  →  {"匹配 ✅" if ok else "不匹配 ❌"}')
+        fields.update(expect=want.hex(), match=ok)
+        if C.json_mode():
+            _json_result('poly1305', **fields)
+        else:
+            print(f'[poly1305/{a.mode}] tag = {tag.hex()}')
+            print(f'  期望 {want.hex()}  →  {"匹配 ✅" if ok else "不匹配 ❌"}')
         return 0 if ok else 1          # 校验命令：不匹配时退出码 1，脚本可感知
+    if C.json_mode():
+        _json_result('poly1305', **fields)
+    else:
+        print(f'[poly1305/{a.mode}] tag = {tag.hex()}')
     return tag
 
 
@@ -800,14 +1062,23 @@ def cmd_aesctr(a):
         if a.length < 0:
             raise ValueError(f'--length 不能为负: {a.length}')
         ks = aesctr_keystream(key, nonce, a.length, a.counter, a.nonce_mode)
-        print(f'[aesctr] keystream({a.length}B) = {ks.hex()}')
+        if C.json_mode():
+            _json_result('aesctr', mode='ks', length=a.length, keystream=ks.hex())
+        else:
+            print(f'[aesctr] keystream({a.length}B) = {ks.hex()}')
         return ks
     data = _parse_hex(a.data_hex, '--data-hex') if a.data_hex else b''
     ks = aesctr_keystream(key, nonce, len(data), a.counter, a.nonce_mode)
     out = bytes(x ^ y for x, y in zip(data, ks))
-    print(f'[aesctr/{a.mode}] {out.hex()}')
-    if a.out_text:
-        print(f'  text = {out!r}')
+    if C.json_mode():
+        fields = dict(mode=a.mode, length=len(out), data=out.hex())
+        if a.out_text:
+            fields['text'] = repr(out)
+        _json_result('aesctr', **fields)
+    else:
+        print(f'[aesctr/{a.mode}] {out.hex()}')
+        if a.out_text:
+            print(f'  text = {out!r}')
     return out
 
 
@@ -827,38 +1098,58 @@ def cmd_rs63(a):
         if hit:
             break
     if hit:
-        print(f'[RS(63,31)] 长度 {len(code)}  合法=True  '
-              f'(order={hit[0]} fcr={hit[1]} nsym={a.nsym})')
+        if C.json_mode():
+            _json_result('rs63', length=len(code), valid=True, order=hit[0],
+                         fcr=hit[1], nsym=a.nsym)
+        else:
+            print(f'[RS(63,31)] 长度 {len(code)}  合法=True  '
+                  f'(order={hit[0]} fcr={hit[1]} nsym={a.nsym})')
         return
     o0, f0 = orders[0], fcrs[0]
     _, sh = rs63_check(code, nsym=a.nsym, fcr=f0, order=o0, auto=False)
-    print(f'[RS(63,31)] 长度 {len(code)}  合法=False')
-    print(f'  syndrome = {sh}  (order={o0} fcr={f0} nsym={a.nsym})')
+    if C.json_mode():
+        _json_result('rs63', length=len(code), valid=False, syndrome=sh,
+                     order=o0, fcr=f0, nsym=a.nsym)
+    else:
+        print(f'[RS(63,31)] 长度 {len(code)}  合法=False')
+        print(f'  syndrome = {sh}  (order={o0} fcr={f0} nsym={a.nsym})')
     if not a.locate:
         return
-    print('  尝试单字节定位…')
+    if not C.json_mode():
+        print('  尝试单字节定位…')
     for o in orders:
         for f in fcrs:
             r = rs63_locate(code, nsym=a.nsym, fcr=f, order=o)
             if r:
                 pos, delta = r
-                print(f'  ★ 修正（order={o} fcr={f}）：pos={pos} '
-                      f'{code[pos]:#04x} → {code[pos] ^ delta:#04x}')
+                if C.json_mode():
+                    _json_locate('rs63', found=True, pos=pos, old=code[pos],
+                                 new=code[pos] ^ delta, order=o, fcr=f)
+                else:
+                    print(f'  ★ 修正（order={o} fcr={f}）：pos={pos} '
+                          f'{code[pos]:#04x} → {code[pos] ^ delta:#04x}')
                 return
-    print('  单字节无法修正（可能是合法码字或错更多字节）')
+    if C.json_mode():
+        _json_locate('rs63', found=False)
+    else:
+        print('  单字节无法修正（可能是合法码字或错更多字节）')
 
 
 def cmd_crc32(a):
     data = _parse_hex(a.data_hex, '--data-hex')
     if a.target_hex is None:
         c = int(crc32_batch(np.frombuffer(data, dtype=np.uint8).reshape(1, -1))[0])
-        print(f'[crc32] {c:08x}')
+        if C.json_mode():
+            _json_result('crc32', crc=f'{c:08x}')
+        else:
+            print(f'[crc32] {c:08x}')
         return
     target = _parse_hex(a.target_hex, '--target-hex')
     if not 1 <= len(target) <= 4:
         raise ValueError(f'--target-hex 需 1~4 字节的 CRC 值，收到 {len(target)} 字节')
     want = int.from_bytes(target, 'big')
-    print(f'[crc32] 目标 {want:08x}，在原数据尾部爆破 1~2 字节')
+    if not C.json_mode():
+        print(f'[crc32] 目标 {want:08x}，在原数据尾部爆破 1~2 字节')
     # 增量算 CRC：先算 data 的原始状态，再对「追加 1/2 字节」做向量化扫描。
     # （旧实现把 1 字节变体塞进 len+2 的数组里，末尾多补一个 0x00，导致单字节搜索永远错。）
     tab = _crc32_tab().astype(np.int64)
@@ -868,16 +1159,28 @@ def cmd_crc32(a):
     crc1 = (st1 ^ 0xFFFFFFFF) & 0xFFFFFFFF
     nhit = 0
     for i in np.nonzero(crc1 == want)[0]:
-        print(f'  ★ 命中：{data.hex()}{int(i):02x}')
+        tail = f'{int(i):02x}'
+        if C.json_mode():
+            _json_hit('crc32', data=data.hex(), tail=tail)
+        else:
+            print(f'  ★ 命中：{data.hex()}{tail}')
         nhit += 1
     st2 = tab[(st1[:, None] ^ b[None, :]) & 0xFF] ^ (st1[:, None] >> 8)
     crc2 = (st2 ^ 0xFFFFFFFF) & 0xFFFFFFFF
     for i, j in np.argwhere(crc2 == want):
-        print(f'  ★ 命中：{data.hex()}{int(i):02x}{int(j):02x}')
+        tail = f'{int(i):02x}{int(j):02x}'
+        if C.json_mode():
+            _json_hit('crc32', data=data.hex(), tail=tail)
+        else:
+            print(f'  ★ 命中：{data.hex()}{tail}')
         nhit += 1
-    if not nhit:
-        print('  未命中')
-    print(f'  扫描 {256 + 65536:,} 变体完成')
+    if C.json_mode():
+        _json_result('crc32', mode='tail-brute', target=f'{want:08x}',
+                     variants=256 + 65536, hit_count=nhit, found=nhit > 0)
+    else:
+        if not nhit:
+            print('  未命中')
+        print(f'  扫描 {256 + 65536:,} 变体完成')
 
 
 def cmd_xorbrute(a):
@@ -885,10 +1188,19 @@ def cmd_xorbrute(a):
     if not data:
         raise ValueError('--data-hex 不能为空')
     t0 = time.time()
-    res = xorbrute(data, max_len=a.max_len, top=a.top)
-    print(f'[xorbrute] {len(data)}B, key 长度 ≤{a.max_len}, 用时 {time.time()-t0:.2f}s')
-    for sc, kh, pt in res:
-        print(f'  score={sc:5d} key={kh:<12} → {pt[:60]!r}')
+    res, done, dt = _xorbrute_scan(data, max_len=a.max_len, top=a.top,
+                                   chunk=a.chunk, checkpoint=a.checkpoint,
+                                   reset=a.reset_checkpoint,
+                                   progress=not a.no_progress)
+    if C.json_mode():
+        for rank, (sc, kh, pt) in enumerate(res):
+            _json_hit('xorbrute', rank=rank, score=sc, key=kh, plaintext=pt.hex())
+        _json_result('xorbrute', length=len(data), max_len=a.max_len,
+                     scanned=done, elapsed=round(dt, 4), hit_count=len(res))
+    else:
+        print(f'[xorbrute] {len(data)}B, key 长度 ≤{a.max_len}, 用时 {time.time()-t0:.2f}s')
+        for sc, kh, pt in res:
+            print(f'  score={sc:5d} key={kh:<12} → {pt[:60]!r}')
 
 
 def main():
@@ -897,12 +1209,12 @@ def main():
     ap.add_argument('--backend', default='auto', choices=['auto', 'torch', 'numpy'],
                     help='计算后端：auto=torch-cuda→torch-cpu→numpy（默认 auto）')
     ap.add_argument('--chunk', type=int, default=1 << 14,
-                    help='每批候选数（默认 16384，chacha --brute 用）')
+                    help='每批候选数 / 断点粒度（默认 16384；chacha --brute、xorbrute 用）')
     C.add_output_args(ap)
     C.add_sched_args(ap)
     sub = ap.add_subparsers(dest='cmd', required=True,
                             metavar='{selftest,chacha,poly1305,rs63,crc32,xorbrute,aesctr}')
-    sub.add_parser('selftest', help='已知向量自测（9 项；全 PASS 退出码 0）')
+    sub.add_parser('selftest', help='已知向量自测（13 项；全 PASS 退出码 0）')
 
     p = sub.add_parser('chacha', help='ChaCha20 密钥流生成 / 候选密钥扫描')
     p.add_argument('--target-hex', required=True, help='目标密钥流，hex（>=1 字节）')

@@ -6,7 +6,7 @@ ctf_ext.py — CTF 算法族内核（与 gpu_crack.py 共用后端）
 子命令
 ------
   tea        TEA / XTEA / XXTEA 加解密（key 固定 16B；TEA/XTEA 数据须 8B 倍数）
-  speck      Speck32/64、Speck64/128 加解密（NSA 组合 16/4、32/3、32/4）
+  speck      Speck32/64、Speck64/128、Speck128/128·192·256 加解密（NSA 组合 16/4、32/3、32/4、64/2、64/3、64/4）
   rc4        RC4 加解密（key 1~256B）
   lcg        LCG 参数恢复 / 状态预测（--mod 支持 2**32 等表达式）
   md5        MD5 批量哈希 / 口令爆破（含空口令）
@@ -42,12 +42,16 @@ ctf_ext.py — CTF 算法族内核（与 gpu_crack.py 共用后端）
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
+import io
 import itertools
+import json
 import math
 import os
 import string
 import sys
+import tempfile
 import time
 
 import numpy as np
@@ -63,8 +67,17 @@ M32 = 0xFFFFFFFF
 # CLI 公共辅助：干净报错（不抛 traceback）
 # =====================================================================
 def _err(msg):
-    """打印一行干净的错误信息并以退出码 2 结束（等价于 argparse 报错）。"""
+    """打印一行干净的错误信息并以退出码 2 结束（等价于 argparse 报错）。
+
+    --json 模式下同时向 stdout 写一条 {"event":"error"} 事件（与 gpu_crack/ctf_tools 一致），
+    便于程序化调用方只解析 stdout 也能拿到结构化错误。
+    """
     print(f'ctf_ext.py: error: {msg}', file=sys.stderr)
+    try:
+        if C.json_mode():
+            C.emit({'event': 'error', 'error': msg})
+    except Exception:                                  # noqa: BLE001  —— 输出层失败不影响报错路径
+        pass
     raise SystemExit(2)
 
 
@@ -74,6 +87,13 @@ def _hex_arg(value, name):
         return bytes.fromhex(value)
     except ValueError:
         _err(f'{name} 必须是十六进制字符串（偶数个十六进制字符），收到 {value!r}')
+
+
+def _diag(msg):
+    """诊断/进度行：--json 时绝不污染 stdout；--quiet 时抑制；默认照常打印（保持文本输出契约）。"""
+    if C.json_mode() or C.quiet():
+        return
+    print(msg, flush=True)
 
 
 def _iroot(x, k):
@@ -244,6 +264,7 @@ def speck_encrypt(pt, key, word_bits=32, key_words=4, rounds=None):
     """
     Speck 加密单块（pt 为 2w 位整数，高 w 位是 x，低 w 位是 y）。
     Speck32/64: word=16, 4 词, 22 轮  |  Speck64/128: word=32, 4 词, 27 轮
+    Speck128/128: word=64, 2 词, 32 轮  |  Speck128/192: 64/3, 33 轮  |  Speck128/256: 64/4, 34 轮
     """
     w = word_bits
     mask = (1 << w) - 1
@@ -504,20 +525,24 @@ def _rsa_verify(n, e, c, m):
     return m is not None and pow(m, e, n) == c % n
 
 
-def rsa_attack(n, e, c, verbose=True):
-    """按性价比顺序尝试多种攻击。返回 (方法, 明文或 None)。"""
+def rsa_attack(n, e, c, verbose=True, log=None):
+    """按性价比顺序尝试多种攻击。返回 (方法, 明文或 None)。
+
+    log: 诊断行回调（cmd_rsa 转发到 _diag，保证 --json/--quiet 下 stdout 干净）。
+    """
+    emit = log if log is not None else (print if verbose else None)
     if n < 4:
         return None, None
-    if verbose:
-        print(f'[rsa] n={n.bit_length()}bit  e={e}')
+    if emit:
+        emit(f'[rsa] n={n.bit_length()}bit  e={e}')
     # 1) n 有平方因子 / 小因子
     for p in _primes_upto(100000):
         if n % p == 0 and 1 < p < n:
             m = _decrypt_with_pq(n, e, c, p, n // p)
             if _rsa_verify(n, e, c, m):
                 return 'small-factor', m
-    if verbose:
-        print('  small-factor: 无')
+    if emit:
+        emit('  small-factor: 无')
     # 2) Wiener
     w = rsa_wiener(n, e)
     if w:
@@ -525,32 +550,32 @@ def rsa_attack(n, e, c, verbose=True):
         m = pow(c, d, n)
         if _rsa_verify(n, e, c, m):
             return 'wiener', m
-    if verbose:
-        print('  wiener: 无')
+    if emit:
+        emit('  wiener: 无')
     # 3) Fermat（p,q 接近）
     f = rsa_fermat(n, 200000)
     if f and 1 < f[0] < n and 1 < f[1] < n:
         m = _decrypt_with_pq(n, e, c, f[0], f[1])
         if _rsa_verify(n, e, c, m):
             return 'fermat', m
-    if verbose:
-        print('  fermat(2e5): 无')
+    if emit:
+        emit('  fermat(2e5): 无')
     # 4) Pollard rho
     r = rsa_pollard_rho(n)
     if r:
         m = _decrypt_with_pq(n, e, c, r, n // r)
         if _rsa_verify(n, e, c, m):
             return 'pollard-rho', m
-    if verbose:
-        print('  pollard-rho: 无')
+    if emit:
+        emit('  pollard-rho: 无')
     # 5) Pollard p-1
     r = rsa_pm1(n)
     if r:
         m = _decrypt_with_pq(n, e, c, r, n // r)
         if _rsa_verify(n, e, c, m):
             return 'pollard-p1', m
-    if verbose:
-        print('  pollard-p1: 无')
+    if emit:
+        emit('  pollard-p1: 无')
     return None, None
 
 
@@ -625,11 +650,21 @@ def _rot13(b):
 
 
 def _looks_flag(b):
-    return any(t in b for t in (b'flag{', b'CTF{', b'ctf{', b'gylike{', b'EAI{'))
+    """判断 bytes 是否带 flag 特征：flag{ / CTF{ 大小写不敏感；项目专用前缀保持精确匹配。
+
+    注意不能把所有前缀一起 lower() 后做子串匹配——如 `eai{` 会命中随机串 "kureai{"，
+    造成 auto_decode 误报；因此专用前缀用原大小写。
+    """
+    low = b.lower()
+    return b'flag{' in low or b'ctf{' in low or b'gylike{' in b or b'EAI{' in b
 
 
-def auto_decode(data, max_depth=4, verbose=True):
-    """广度优先多层解码，优先返回像 flag 的结果。"""
+def auto_decode(data, max_depth=4, verbose=True, log=None):
+    """广度优先多层解码，优先返回像 flag 的结果。
+
+    log: 诊断行回调（cmd_encode 用它转发到 _diag，避免 --json/--quiet 污染 stdout）。
+    """
+    emit = log if log is not None else (print if verbose else None)
     frontier = [(data, [])]
     seen = {data}
     for depth in range(max_depth):
@@ -644,8 +679,8 @@ def auto_decode(data, max_depth=4, verbose=True):
                 nxt.append((res, path + [name]))
                 if _looks_flag(res):
                     return res, path + [name]
-        if verbose:
-            print(f'  depth {depth+1}: {len(nxt)} 个候选, 示例 {nxt[:3]}')
+        if emit:
+            emit(f'  depth {depth+1}: {len(nxt)} 个候选, 示例 {nxt[:3]}')
         frontier = nxt[:200]
     return None, None
 
@@ -660,7 +695,7 @@ def cmd_speck(a):
         _err(f'--key-words 只支持 2/3/4，收到 {a.key_words}')
     if a.rounds is None and (w, a.key_words) not in SPECK_ROUNDS:
         _err(f'不支持的参数组合 --word-bits {w} --key-words {a.key_words}'
-             f'（NSA 规格为 16/4、32/3、32/4；自定义轮数请显式给 --rounds）')
+             f'（NSA 规格为 16/4、32/3、32/4、64/2、64/3、64/4；自定义轮数请显式给 --rounds）')
     if a.rounds is not None and a.rounds < 1:
         _err(f'--rounds 必须 >= 1，收到 {a.rounds}')
     try:
@@ -675,12 +710,19 @@ def cmd_speck(a):
         _err(f'--key-hex 超过 {w}bit x {a.key_words} 词的密钥宽度')
     if data.bit_length() > 2 * w:
         _err(f'--data-hex 超过单块 {2 * w}bit 宽度')
+    rounds = a.rounds
     if a.op == 'encrypt':
-        out = speck_encrypt(data, key, word_bits=w, key_words=a.key_words, rounds=a.rounds)
+        out = speck_encrypt(data, key, word_bits=w, key_words=a.key_words, rounds=rounds)
     else:
-        out = speck_decrypt(data, key, word_bits=w, key_words=a.key_words, rounds=a.rounds)
+        out = speck_decrypt(data, key, word_bits=w, key_words=a.key_words, rounds=rounds)
+    if rounds is None:
+        rounds = SPECK_ROUNDS.get((w, a.key_words), 27)
     nbytes = (2 * w) // 8
-    print(f'[speck/{a.op}] w={w} keys={a.key_words}  {out:0{nbytes*2}x}  ({out.to_bytes(nbytes, "big")!r})')
+    text = (f'[speck/{a.op}] w={w} keys={a.key_words}  {out:0{nbytes*2}x}  '
+            f'({out.to_bytes(nbytes, "big")!r})')
+    C.emit({'event': 'result', 'kind': 'speck', 'op': a.op, 'word_bits': w,
+            'key_words': a.key_words, 'rounds': rounds, 'block_hex': f'{out:0{nbytes*2}x}',
+            'text': text})
 
 
 def cmd_selftest(a):
@@ -831,6 +873,170 @@ def cmd_selftest(a):
     ok = (list(_gen_candidates('ab', 1, 2)) == [b'a', b'b', b'aa', b'ab', b'ba', b'bb']
           and _zip_try(('Z:/nonexistent.zip', b'x', 16)) is None)
     print(f'[ZIP 爆破骨架] {"PASS" if ok else "FAIL"}')
+    fails += not ok
+
+    # ---------------------------------------------------------------- 新增回归（audit-ext）
+    # Speck128 系列：NSA 官方 128/128 向量 + 128/192、128/256 往返（--word-bits 64 已放开）
+    # 官方向量：key=0f0e0d0c0b0a0908 0706050403020100（K[1],K[0]）
+    #          pt=6c61766975716520 7469206564616d20 → x/y 按论文词序，ct=a65d985179783265 7860fedf5c570d18
+    key128 = 0x0F0E0D0C0B0A09080706050403020100
+    pt128 = (0x6C61766975716520 << 64) | 0x7469206564616D20
+    ct128 = speck_encrypt(pt128, key128, word_bits=64, key_words=2)
+    ok = (ct128 == 0xA65D9851797832657860FEDF5C570D18
+          and speck_decrypt(ct128, key128, word_bits=64, key_words=2) == pt128)
+    print(f'[Speck128/128 向量] {"PASS" if ok else "FAIL"}  {ct128:032x}')
+    fails += not ok
+    ok = True
+    for kw in (3, 4):
+        kk = (1 << (64 * kw)) - 0x1234567890ABCDEF
+        pp = pt128 ^ (kw << 64)
+        cc = speck_encrypt(pp, kk, word_bits=64, key_words=kw)
+        if speck_decrypt(cc, kk, word_bits=64, key_words=kw) != pp:
+            ok = False
+    print(f'[Speck128/192+256 往返] {"PASS" if ok else "FAIL"}')
+    fails += not ok
+
+    # --json 契约：tea/speck/rc4/lcg/md5/rsa/encode 的 stdout 必须只有单行 JSON
+    class _NS(argparse.Namespace):
+        pass
+
+    def _json_lines(fn):
+        buf = io.StringIO()
+        C.set_output(json_mode=True, quiet=False)
+        try:
+            with contextlib.redirect_stdout(buf):
+                rcv = fn()
+        finally:
+            C.set_output(json_mode=False, quiet=False)
+        lines = [ln for ln in buf.getvalue().splitlines() if ln.strip()]
+        return rcv, lines
+
+    cases = [
+        lambda: cmd_tea(_NS(mode='tea', op='encrypt', key_hex='00' * 16, data_hex='00' * 8)),
+        lambda: cmd_speck(_NS(key_hex='1918111009080100', data_hex='6574694c', op='encrypt',
+                              word_bits=16, key_words=4, rounds=None)),
+        lambda: cmd_rc4(_NS(key_hex='4b6579', data_hex='506c61696e74657874')),
+        lambda: cmd_lcg(_NS(mod='2**32', outs='1,2,3,4', predict=3)),
+        lambda: cmd_md5(_NS(target=hashlib.md5(b'ab').hexdigest(), charset='ab', max_len=1)),
+        lambda: cmd_rsa(_NS(n=str(1000003 * 1000033), e=65537,
+                            c=str(pow(0x1234, 65537, 1000003 * 1000033)))),
+        lambda: cmd_encode(_NS(data_hex=None, data='flag{json}')),
+    ]
+    objs = []
+    ok = True
+    for fn in cases:
+        _, lines = _json_lines(fn)
+        if len(lines) != 1:                     # 必须只有结果行，诊断行不得进 stdout
+            ok = False
+            continue
+        try:
+            o = json.loads(lines[0])
+        except Exception:
+            ok = False
+            continue
+        if 'kind' not in o or o.get('event') not in ('result', 'hit'):
+            ok = False
+        objs.append(o)
+    print(f'[CLI --json 契约] {"PASS" if ok else "FAIL"}  {len(objs)}/7 条单行 JSON')
+    fails += not ok
+
+    # --quiet：诊断/进度行必须被抑制，只剩结果行
+    buf = io.StringIO()
+    C.set_output(json_mode=False, quiet=True)
+    try:
+        with contextlib.redirect_stdout(buf):
+            cmd_encode(_NS(data_hex=None, data=base64.b64encode(b'666c61677b717d').decode()))
+            cmd_rsa(_NS(n=str(1000003 * 1000033), e=65537,
+                        c=str(pow(0x1234, 65537, 1000003 * 1000033))))
+    finally:
+        C.set_output(json_mode=False, quiet=False)
+    qout = buf.getvalue()
+    ok = 'depth' not in qout and 'small-factor' not in qout and 'flag' in qout and '明文 hex=1234' in qout
+    print(f'[--quiet 抑制诊断] {"PASS" if ok else "FAIL"}')
+    fails += not ok
+
+    def _expect_rc2(fn):
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                fn()
+        except SystemExit as ex:
+            return ex.code == 2
+        return False
+
+    ok = (_expect_rc2(lambda: cmd_mdext(_NS(algo='md5', orig_len=23, digest_hex='zz',
+                                            append_hex='')))
+          and _expect_rc2(lambda: cmd_mdext(_NS(algo='md5', orig_len=23, digest_hex='aabb',
+                                                append_hex='')))
+          and _expect_rc2(lambda: cmd_mdext(_NS(algo='md5', orig_len=-1, digest_hex='00' * 16,
+                                                append_hex='')))
+          and _expect_rc2(lambda: cmd_mdext(_NS(algo='md5', orig_len=1 << 61,
+                                                digest_hex='00' * 16, append_hex='')))
+          and _expect_rc2(lambda: cmd_tea(_NS(mode='xxtea', op='decrypt', key_hex='00' * 16,
+                                              data_hex='00' * 4)))
+          and _expect_rc2(lambda: cmd_eccscan(_NS(pub_hex=None, px='1', py='1', start=-1,
+                                                  count=1, curve='secp256k1', jobs=1))))
+    print(f'[CLI 非法参数校验] {"PASS" if ok else "FAIL"}  mdext/xxtea/eccscan → rc=2')
+    fails += not ok
+
+    # eccscan 命中时命令返回值必须不是 int（否则 main 会把私钥当退出码）
+    px, py = ecc_pub('secp256k1', 1337)
+    buf = io.StringIO()
+    C.set_output(json_mode=False, quiet=True)
+    try:
+        with contextlib.redirect_stdout(buf):
+            rc_ecc = cmd_eccscan(_NS(pub_hex=None, px=str(px), py=str(py), start=1337,
+                                     count=1, curve='secp256k1', jobs=1))
+    finally:
+        C.set_output(json_mode=False, quiet=False)
+    ok = rc_ecc is None and 'k = 1337' in buf.getvalue()
+    print(f'[eccscan 成功退出码] {"PASS" if ok else "FAIL"}  返回={rc_ecc!r}')
+    fails += not ok
+
+    # encode：大写 FLAG{} 也算 flag 特征；但不能把 "kureai{" 这类随机串误判成 flag
+    got, path = auto_decode(base64.b64encode(b'FLAG{upper_case}'), verbose=False)
+    ok = got == b'FLAG{upper_case}' and not _looks_flag(b'2 S|kureai{U~p{om2 Kci{d')
+    print(f'[encode 大写 FLAG] {"PASS" if ok else "FAIL"}  路径={path}')
+    fails += not ok
+
+    # ECC 标量边界：负标量/零标量给干净异常，而不是静默算错或死循环
+    ok = True
+    for badk in (-1, 0):
+        try:
+            ecc_pub('secp256k1', badk)
+            ok = False
+        except ValueError:
+            pass
+    print(f'[ECC 标量边界] {"PASS" if ok else "FAIL"}')
+    fails += not ok
+
+    # RSA 明文为 0 时仍要输出 1 字节 hex "00"（旧实现输出空串 "明文 hex="）
+    n_rsa0 = 1000003 * 1000033
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        cmd_rsa(_NS(n=str(n_rsa0), e=65537, c='0'))
+    ok = '明文 hex=00' in buf.getvalue()
+    print(f'[RSA 明文 0 输出] {"PASS" if ok else "FAIL"}')
+    fails += not ok
+
+    # zipbrute：非 zip / 未加密 zip 必须是干净 rc=2（不得静默"未命中"或误报口令）
+    import zipfile
+    with tempfile.TemporaryDirectory() as td:
+        plain_zip = os.path.join(td, 'plain.zip')
+        with zipfile.ZipFile(plain_zip, 'w') as zf:
+            zf.writestr('a.txt', b'hello')
+        notzip = os.path.join(td, 'notzip.bin')
+        with open(notzip, 'wb') as fh:
+            fh.write(b'GIF89a not a zip')
+        wl = os.path.join(td, 'wl.txt')
+        with open(wl, 'wb') as fh:
+            fh.write(b'x\n')
+        ok = (_expect_rc2(lambda: cmd_zipbrute(_NS(zip=notzip, wordlist=wl, charset=None,
+                                                   min_len=1, max_len=1, jobs=1,
+                                                   max_bytes=1 << 20)))
+              and _expect_rc2(lambda: cmd_zipbrute(_NS(zip=plain_zip, wordlist=wl, charset=None,
+                                                       min_len=1, max_len=1, jobs=1,
+                                                       max_bytes=1 << 20))))
+    print(f'[zipbrute 输入校验] {"PASS" if ok else "FAIL"}  非zip/未加密 → rc=2')
     fails += not ok
     return fails
 
@@ -1095,8 +1301,13 @@ def _ec_affine_add(P, Q, p, a):
 
 
 def _ec_base_mul(k, p, a, gx, gy):
-    """k·G → Jacobian (X, Y, Z)（一次性标量乘，内部用仿射 + 逆元，只有 256 步）。"""
-    k %= p
+    """k·G → Jacobian (X, Y, Z)（一次性标量乘，内部用仿射 + 逆元，最多 ~256 步）。
+
+    标量按整数直接展开：不能 `k %= p`（群阶 n ≠ 域素数 p，按 p 归约会算错 k≥p 的点），
+    也不接受负数（负标量会让 while 永不结束）。
+    """
+    if k < 0:
+        raise ValueError('ECC 标量必须 >= 0')
     G = (gx, gy)
     R = None
     add = G
@@ -1148,9 +1359,13 @@ def ecc_search(curve, tx, ty, start, count, jobs=1, chunk=20000):
 
 def ecc_pub(curve, k):
     """k·G 的仿射坐标（自测/构造用）。"""
+    if k < 0:
+        raise ValueError('ECC 私钥 k 必须 >= 0')
     c = CURVES[curve]
     p = c['p']
-    X, Y, Z = _ec_base_mul(k % p, p, c['a'], c['gx'], c['gy'])
+    X, Y, Z = _ec_base_mul(k, p, c['a'], c['gx'], c['gy'])
+    if Z == 0:
+        raise ValueError('k=0 对应无穷远点，没有仿射公钥坐标')
     zi = pow(Z, -1, p)
     return X * zi * zi % p, Y * zi * zi % p * zi % p
 
@@ -1158,7 +1373,21 @@ def ecc_pub(curve, k):
 def cmd_mdext(a):
     """哈希长度扩展：已知 (原长度, 原摘要)，构造 原消息||glue||append 的合法摘要。"""
     append = _hex_arg(a.append_hex, '--append-hex') if a.append_hex else b''
-    glue, new = hash_extend(a.algo, a.orig_len, a.digest_hex, append)
+    # 原长度必须是 [0, 2^61-1]：负数会让 64bit 位长回绕，>=2^61 会让 bit_len 溢出 64 位，
+    # 两者都会静默产出错误的 glue/new_digest（旧实现直接接受，属静默错误结果）。
+    if a.orig_len < 0:
+        _err(f'--orig-len 不能为负，收到 {a.orig_len}')
+    if a.orig_len >= (1 << 61):
+        _err(f'--orig-len 必须 < 2^61（64bit 长度字段上限），收到 {a.orig_len}')
+    try:
+        digest = bytes.fromhex(str(a.digest_hex).strip())
+    except ValueError:
+        _err(f'--digest-hex 必须是十六进制字符串，收到 {a.digest_hex!r}')
+    want = 16 if a.algo == 'md5' else 20
+    if len(digest) != want:
+        _err(f'{a.algo} 摘要必须 {want} 字节（{want * 2} 个 hex 字符），'
+             f'收到 {len(digest)} 字节')
+    glue, new = hash_extend(a.algo, a.orig_len, digest.hex(), append)
     C.emit({'event': 'result', 'kind': 'mdext', 'algo': a.algo, 'orig_len': a.orig_len,
             'glue': glue.hex(), 'tail': (glue + append).hex(), 'new_digest': new.hex(),
             'forged_len': a.orig_len + len(glue) + len(append),
@@ -1190,10 +1419,36 @@ def _gen_candidates(charset, min_len, max_len):
             yield ''.join(tup).encode()
 
 
+def _zip_first_entry(path):
+    """探测 zip 第一个非目录条目：返回 (name, encrypted)；没有文件条目返回 (None, False)。
+
+    非法 zip 抛 zipfile.BadZipFile。cmd_zipbrute 用它把「非 zip / 未加密 zip」变成
+    干净的输入错误，而不是静默「未命中」或把第一个候选误报成口令。
+    """
+    import zipfile
+    with zipfile.ZipFile(path) as zf:
+        names = [n for n in zf.namelist() if not n.endswith('/')]
+        if not names:
+            return None, False
+        info = zf.getinfo(names[0])
+        return names[0], bool(info.flag_bits & 0x1)
+
+
 def cmd_zipbrute(a):
     """ZIP 口令爆破：字典或字符集掩码。"""
     if not os.path.exists(a.zip):
         return _err(f'找不到 zip 文件: {a.zip}')
+    import zipfile
+    try:
+        first, encrypted = _zip_first_entry(a.zip)
+    except zipfile.BadZipFile:
+        return _err(f'不是有效的 zip 文件（无法解析）: {a.zip}')
+    except OSError as ex:
+        return _err(f'zip 文件无法读取: {a.zip}（{ex}）')
+    if first is None:
+        return _err(f'zip 中没有文件条目（只有目录或为空），无法爆破: {a.zip}')
+    if not encrypted:
+        return _err(f'第一个条目未加密（无需口令爆破，任一口令都会"成功"）: {first}')
     if a.wordlist:
         if not os.path.exists(a.wordlist):
             return _err(f'找不到字典文件: {a.wordlist}')
@@ -1224,9 +1479,10 @@ def cmd_zipbrute(a):
         shown = got.decode('utf-8')
     except UnicodeDecodeError:
         shown = got.decode('latin-1')
-    C.emit({'event': 'hit', 'kind': 'zipbrute', 'password': shown, 'elapsed': round(dt, 3),
+    C.emit({'event': 'hit', 'kind': 'zipbrute', 'found': True, 'password': shown,
+            'elapsed': round(dt, 3),
             'text': f'[zipbrute] ★ 口令 = {shown!r}  （{dt:.2f}s）'})
-    return shown
+    return None
 
 
 def cmd_eccscan(a):
@@ -1243,6 +1499,8 @@ def cmd_eccscan(a):
         return _err('需要 --pub-hex，或同时给 --px/--py')
     if a.count <= 0:
         return _err('--count 必须 > 0')
+    if a.start < 0:
+        return _err(f'--start（起始私钥）必须 >= 0，收到 {a.start}')
     curve = a.curve
     if curve not in CURVES:
         return _err(f'未知曲线 {curve}；可选: {", ".join(CURVES)}')
@@ -1258,7 +1516,7 @@ def cmd_eccscan(a):
         return None
     C.emit({'event': 'hit', 'kind': 'eccscan', 'curve': curve, 'private_key': k,
             'private_key_hex': hex(k), 'text': f'  ★ 私钥 k = {k}  (0x{k:x})'})
-    return k
+    return None                       # 关键：命中不能返回 int，否则 main 会把它当退出码
 
 
 def cmd_tea(a):
@@ -1273,7 +1531,7 @@ def cmd_tea(a):
         if a.op == 'decrypt':
             if len(data) % 4:
                 _err(f'XXTEA 的 --data-hex 必须是 4 字节的整数倍，收到 {len(data)} 字节')
-            if 0 < len(data) < 8:
+            if len(data) < 8:
                 _err(f'XXTEA 密文至少 8 字节，收到 {len(data)} 字节')
     k = [int(x) for x in np.frombuffer(key, dtype='<u4')]   # 必须转 Python int
     if a.mode == 'tea':
@@ -1282,14 +1540,18 @@ def cmd_tea(a):
         f = xtea_encrypt_block if a.op == 'encrypt' else xtea_decrypt_block
     else:
         out = xxtea_encrypt(data, key) if a.op == 'encrypt' else xxtea_decrypt(data, key)
-        print(f'[{a.mode} {a.op}] {out.hex()}')
+        text = f'[{a.mode} {a.op}] {out.hex()}'
+        C.emit({'event': 'result', 'kind': 'tea', 'mode': a.mode, 'op': a.op,
+                'data_hex': out.hex(), 'text': text})
         return
     out = bytearray()
     for i in range(0, len(data) - 7, 8):
         v0, v1 = int.from_bytes(data[i:i + 4], 'little'), int.from_bytes(data[i + 4:i + 8], 'little')
         r0, r1 = f(v0, v1, k)
         out += r0.to_bytes(4, 'little') + r1.to_bytes(4, 'little')
-    print(f'[{a.mode} {a.op}] {bytes(out).hex()}')
+    text = f'[{a.mode} {a.op}] {bytes(out).hex()}'
+    C.emit({'event': 'result', 'kind': 'tea', 'mode': a.mode, 'op': a.op,
+            'data_hex': bytes(out).hex(), 'text': text})
 
 
 def cmd_rc4(a):
@@ -1299,7 +1561,9 @@ def cmd_rc4(a):
         _err('--key-hex 不能为空（RC4 密钥长度 1..256 字节）')
     if len(key) > 256:
         _err(f'--key-hex 最长 256 字节，收到 {len(key)} 字节')
-    print(f'[rc4] {rc4(data, key).hex()}')
+    out = rc4(data, key)
+    C.emit({'event': 'result', 'kind': 'rc4', 'data_hex': out.hex(),
+            'text': f'[rc4] {out.hex()}'})
 
 
 def cmd_lcg(a):
@@ -1324,9 +1588,13 @@ def cmd_lcg(a):
         _err(f'--predict 不能为负，收到 {a.predict}')
     xs = [x % mod for x in xs]          # C 的有符号打印也能正确当余数处理
     r = lcg_recover(xs, mod)
-    print(f'[lcg] 恢复: a={r[0] if r else None} c={r[1] if r else None}')
+    pred = lcg_predict(xs, mod, a.predict) if r else None
+    text = f'[lcg] 恢复: a={r[0] if r else None} c={r[1] if r else None}'
     if r:
-        print(f'  预测 {a.predict} 个: {lcg_predict(xs, mod, a.predict)}')
+        text += f'\n  预测 {a.predict} 个: {pred}'
+    C.emit({'event': 'result', 'kind': 'lcg', 'mod': mod,
+            'a': r[0] if r else None, 'c': r[1] if r else None,
+            'predict': pred, 'text': text})
 
 
 def cmd_md5(a):
@@ -1336,7 +1604,15 @@ def cmd_md5(a):
     if a.max_len < 0:
         _err(f'--max-len 不能为负，收到 {a.max_len}')
     hit, tried, dt = md5_crack(tgt, a.charset, a.max_len)
-    print(f'[md5] 尝试 {tried:,} 次 / {dt:.2f}s  {"命中: " + repr(hit) if hit is not None else "未命中"}')
+    shown = '命中: ' + repr(hit) if hit is not None else '未命中'
+    if hit is not None:
+        C.emit({'event': 'hit', 'kind': 'md5', 'found': True, 'password_hex': hit.hex(),
+                'tried': tried, 'elapsed': round(dt, 3),
+                'text': f'[md5] 尝试 {tried:,} 次 / {dt:.2f}s  {shown}'})
+    else:
+        C.emit({'event': 'result', 'kind': 'md5', 'found': False, 'tried': tried,
+                'elapsed': round(dt, 3),
+                'text': f'[md5] 尝试 {tried:,} 次 / {dt:.2f}s  {shown}'})
 
 
 def _parse_int(s):
@@ -1374,12 +1650,22 @@ def cmd_rsa(a):
         _err(f'--e 必须是 >= 3 的奇数（RSA 公开指数），收到 {a.e}')
     if c < 0:
         _err(f'--c 不能为负，收到 {c}')
-    meth, dec = rsa_attack(n, a.e, c)
+    steps = []                          # 攻击过程诊断行：--json 不进 stdout；--quiet 抑制
+    meth, dec = rsa_attack(n, a.e, c, verbose=False, log=steps.append)
+    for line in steps:
+        _diag(line)
     if dec is not None:
-        b = dec.to_bytes((dec.bit_length() + 7) // 8, 'big')
-        print(f'  ★ 方法={meth}  明文 hex={b.hex()}  文本={b!r}')
+        nb = max(1, (dec.bit_length() + 7) // 8)     # m=0 也要给 1 字节 "00"，不能输出空 hex
+        b = dec.to_bytes(nb, 'big')
+        text = f'  ★ 方法={meth}  明文 hex={b.hex()}  文本={b!r}'
+        C.emit({'event': 'hit', 'kind': 'rsa', 'n_bits': n.bit_length(), 'e': a.e,
+                'method': meth, 'plaintext_hex': b.hex(), 'verified': True,
+                'steps': steps, 'text': text})
     else:
-        print('  未攻破（试试共模/广播/Coppersmith）')
+        text = '  未攻破（试试共模/广播/Coppersmith）'
+        C.emit({'event': 'result', 'kind': 'rsa', 'n_bits': n.bit_length(), 'e': a.e,
+                'method': None, 'plaintext_hex': None, 'verified': False,
+                'steps': steps, 'text': text})
 
 
 def cmd_encode(a):
@@ -1387,9 +1673,17 @@ def cmd_encode(a):
         data = _hex_arg(a.data_hex, '--data-hex')
     else:
         data = a.data.encode('utf-8')
-    got, path = auto_decode(data)
-    print(f'\n[decode] 路径={path}')
-    print(f'  结果={got!r}')
+    steps = []
+    got, path = auto_decode(data, verbose=False, log=steps.append)
+    for line in steps:
+        _diag(line)
+    result = f'\n[decode] 路径={path}\n  结果={got!r}'
+    if got is not None:
+        C.emit({'event': 'hit', 'kind': 'encode', 'found': True, 'path': path,
+                'result_hex': got.hex(), 'text': result})
+    else:
+        C.emit({'event': 'result', 'kind': 'encode', 'found': False, 'path': path,
+                'result_hex': None, 'text': result})
 
 
 def main():
@@ -1410,11 +1704,12 @@ def main():
     p.add_argument('--data-hex', required=True,
                    help='数据裸 hex；tea/xtea 须 8B 倍数，xxtea 解密须 4B 倍数且>=8B')
 
-    p = sub.add_parser('speck', help='Speck32/64、Speck64/128 单块加解密')
+    p = sub.add_parser('speck', help='Speck32/64、Speck64/128、Speck128/* 单块加解密')
     p.add_argument('--key-hex', required=True, help='小端打包的密钥（k0 在最低位），可为整数形式')
     p.add_argument('--data-hex', required=True, help='2*word_bits 位的大端整数（可为整数形式）')
     p.add_argument('--op', default='encrypt', choices=['encrypt', 'decrypt'], help='加/解密，默认 encrypt')
-    p.add_argument('--word-bits', type=int, default=32, choices=[16, 32], help='字宽 16/32，默认 32')
+    p.add_argument('--word-bits', type=int, default=32, choices=[16, 32, 64],
+                   help='字宽 16/32/64，默认 32（64 对应 Speck128 系列）')
     p.add_argument('--key-words', type=int, default=4, help='密钥字数 2/3/4，默认 4')
     p.add_argument('--rounds', type=int, default=None, help='轮数覆盖（自定义组合必填）')
 
@@ -1473,12 +1768,14 @@ def main():
     a = ap.parse_args()
     C.apply_output_args(a)
     G.init_backend(a.backend)
-    rc = {'selftest': cmd_selftest, 'tea': cmd_tea, 'speck': cmd_speck, 'rc4': cmd_rc4,
-          'lcg': cmd_lcg, 'md5': cmd_md5, 'rsa': cmd_rsa, 'encode': cmd_encode,
-          'mdext': cmd_mdext, 'bm': cmd_bm, 'zipbrute': cmd_zipbrute,
-          'eccscan': cmd_eccscan}[a.cmd](a)
-    # 只有 selftest 会返回 int（失败项数，便于上层集成脚本判断）；其余命令返回 None = 成功
-    sys.exit(0 if not isinstance(rc, int) else rc)
+    handler = {'selftest': cmd_selftest, 'tea': cmd_tea, 'speck': cmd_speck, 'rc4': cmd_rc4,
+               'lcg': cmd_lcg, 'md5': cmd_md5, 'rsa': cmd_rsa, 'encode': cmd_encode,
+               'mdext': cmd_mdext, 'bm': cmd_bm, 'zipbrute': cmd_zipbrute,
+               'eccscan': cmd_eccscan}[a.cmd]
+    rc = handler(a)
+    # 只有 selftest 的 int 返回值表示失败项数，才映射为退出码；其余命令的返回值一律忽略，
+    # 成功=0（否则如 eccscan 命中返回私钥 k 时，进程退出码会变成 k）。
+    sys.exit(rc if (a.cmd == 'selftest' and isinstance(rc, int)) else 0)
 
 
 if __name__ == '__main__':
