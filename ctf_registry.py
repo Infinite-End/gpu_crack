@@ -34,7 +34,7 @@ from typing import Dict, Iterator, List, Optional, Tuple
 
 # 单一版本真源：README / CLI_REFERENCE / SKILL.md / kernels.md 的「文档版本」必须等于它。
 # doc_lint.py 读这个常量做校验，其他位置不要再硬编码版本号。
-VERSION = '3.3'
+VERSION = '3.4'
 
 PLUGIN_DIRNAME = 'plugins'
 

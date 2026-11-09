@@ -2,7 +2,7 @@
 
 | 文档属性 | 值 |
 |---|---|
-| 文档版本 | v3.3（2026-11-09） |
+| 文档版本 | v3.4（2026-11-09） |
 | 适用工具 | gpu_crack toolkit v2（仓库根目录） |
 | 校验状态 | 与 `--help` 和各模块自测一致；`python -X utf8 verify_all.py` 六层全绿（doc_lint 50 / 模块 13+31+23 / 主框架 42 / consistency 45 / fuzz 17 类 / dispatcher+示例） |
 | 配套文档 | [README.md](README.md)（项目说明）、skill 的 `SKILL.md` / `references/kernels.md`（使用策略） |

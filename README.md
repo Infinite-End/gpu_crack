@@ -8,11 +8,11 @@
 
 | 文档属性 | 值 |
 |---|---|
-| 文档版本 | v3.3（2026-11-09） |
+| 文档版本 | v3.4（2026-11-09） |
 | 工具版本 | gpu_crack toolkit v2 |
 | 校验状态 | `python -X utf8 verify_all.py` 全绿（doc_lint 50 项 / 模块自测 13+31+23 项 / 主框架 42 项 / consistency 45/45 / fuzz 17 类 / 统一入口+示例 6/6） |
 | 适用环境 | Windows + Python 3.15 + torch 2.14.1+cu130（无 torch 时自动回退 numpy） |
-| GitHub | https://github.com/Infinite-End/gpu_crack（**public / MIT**，tag `v3.3`） |
+| GitHub | https://github.com/Infinite-End/gpu_crack（**public / MIT**，tag `v3.4`） |
 | 配套文档 | [CLI_REFERENCE.md](CLI_REFERENCE.md)（**参数/输出/退出码以它为准**）、`skill/SKILL.md` 与 `skill/references/kernels.md` |
 | 许可证 | [MIT](LICENSE) |
 
@@ -289,8 +289,10 @@ python -X utf8 verify_all.py --quick --only doc,fuzz   # 快速/局部
 ├─ doc_lint.py        文档一致性检查（参数/模块/计数/版本/矩阵必须与真实 CLI 对齐）
 ├─ docs/bench.md      本机吞吐基准（`bench --markdown` 生成，勿手改）
 ├─ examples/          示例输入生成器 + 逐条跑法（`--check` 逐条复跑；examples/out/ 不入库）
-├─ .github/workflows/ci.yml  CI：doc_lint + 自测 + 对拍 + fuzz + 统一入口 + 示例复跑 + verify_all
+├─ .github/workflows/ci.yml  CI：doc_lint + 自测 + 对拍 + fuzz + 统一入口 + 示例复跑 + verify_all + 插件/zip 契约
 ├─ dsh-plugin/         DeepSeek Harness 插件（把 skill/ 注册为 bundled 技能；见 dsh-plugin/README.md）
+├─ build_skill_zip.py  生成/校验 skill.zip（技能 zip 安装包；--check 供 CI 做同步校验）
+├─ skill.zip           skill 独立安装包（build_skill_zip.py 生成，勿手改；含工具箱，解压即用）
 ├─ README.md          本文件（项目说明）
 ├─ CLI_REFERENCE.md   完整 CLI 参考（参数/输出/退出码/示例）
 ├─ requirements.txt    依赖清单（pip install -r requirements.txt）
@@ -304,6 +306,18 @@ python -X utf8 verify_all.py --quick --only doc,fuzz   # 快速/局部
 ```
 
 ## 12. 变更记录
+
+### v3.4（2026-11-09：skill.zip 独立安装包）
+
+- 新增 `build_skill_zip.py`：把 `skill/` 与运行所需的工具箱、文档、示例打包成 `skill.zip`。
+  zip 内是**单一顶层目录 `ctf-toolkit/`**（符合 DSH 等宿主「zip 上传技能」的安装约定：解压后
+  `<dest>/SKILL.md`），且 `gpu_crack.py` 与 `SKILL.md` 同目录，因此 `scripts/ctf.py` 向上即可
+  自举发现工具箱——**解压即用，无需设置任何环境变量**。
+- 打包是确定性的（条目排序 + 固定时间戳 + 固定权限位）：源文件不变则 zip 字节不变；
+  `python -X utf8 build_skill_zip.py --check` 校验 zip 与源文件同步（CI 已接入，改了 skill/ 或工具箱
+  却忘了重建 zip 会 FAIL）。
+- `skill.zip` 纳入仓库，供只支持 zip 安装技能（而非插件/目录）的宿主直接上传使用；
+  需要 Python 3.11+ 与 numpy（torch/CUDA 可选，缺失时自动回落 numpy 后端）。
 
 ### v3.3（2026-11-09：DeepSeek Harness 技能插件）
 
@@ -420,7 +434,7 @@ python -X utf8 verify_all.py --quick --only doc,fuzz   # 快速/局部
 
 ## 13. GitHub 仓库与跨机使用
 
-- 仓库：https://github.com/Infinite-End/gpu_crack （**public / 开源**），标签 `v3.3`。
+- 仓库：https://github.com/Infinite-End/gpu_crack （**public / 开源**），标签 `v3.4`。
 - 仓库根目录 = 本目录。`skill/` 是 skill 定义（`SKILL.md` / `SKILL.en.md` / `references/kernels.md` / `scripts/ctf.py` / `agents/openai.yaml`）的**同步副本**；
   修改 skill 源后需同步到 `skill/`，`doc_lint.py` 会校验镜像一致性。
 - 在其它机器/其它模型上使用：
@@ -430,6 +444,10 @@ python -X utf8 verify_all.py --quick --only doc,fuzz   # 快速/局部
   3. 跑 `python -X utf8 doc_lint.py`（有 repo 内 `skill/` 时自动用镜像）与 `python -X utf8 consistency.py` 确认环境。
 - **DeepSeek Harness（DSH）集成**：`dsh-plugin/` 是本地 DSH plugin bundle，把 `skill/` 注册为内置技能
   （技能名 `ctf-toolkit`，装载/卸载命令见 `dsh-plugin/README.md`）。技能内容实时读取仓库，无需复制。
+- **zip 安装（仅支持 zip 上传技能的宿主）**：仓库根的 `skill.zip` 是自包含技能安装包（顶层目录
+  `ctf-toolkit/`，含 `SKILL.md`、技能资源与整个工具箱），直接上传即可，解压后 `scripts/ctf.py`
+  无需环境变量即可找到工具箱。源文件改动后运行 `python -X utf8 build_skill_zip.py` 重建，
+  `--check` 可校验是否同步（CI 会拦下过期的 zip）。
 
 ## 14. 许可证
 

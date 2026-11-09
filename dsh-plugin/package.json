@@ -1,6 +1,6 @@
 {
   "name": "dsh-skill-gpu-crack",
-  "version": "3.3.0",
+  "version": "3.4.0",
   "description": "DeepSeek Harness skill provider for the gpu_crack CTF toolkit: exposes the repository's skill/ directory as a bundled model-facing skill (GPU batch brute-force / crypto / forensics / pwn triage).",
   "keywords": [
     "dsh",

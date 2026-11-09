@@ -7,7 +7,7 @@ description: GPU-accelerated, command-line CTF toolkit in this repository for ba
 
 | 文档属性 | 值 |
 |---|---|
-| 文档版本 | v3.3（2026-11-09） |
+| 文档版本 | v3.4（2026-11-09） |
 | 适用工具 | gpu_crack toolkit v2（仓库根目录） |
 | 校验状态 | `python -X utf8 verify_all.py` 六层全绿（doc_lint 50 / 模块 13+31+23 / 主框架 42 / consistency 45/45 / fuzz 17 类 / 统一入口+示例 6/6） |
 | 配套文档 | `CLI_REFERENCE.md`（仓库根，规范性参数/输出/退出码）、`README.md`（仓库根）、`references/kernels.md`、`SKILL.en.md`（英文精简版） |
