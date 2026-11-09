@@ -89,6 +89,23 @@ TOOLKIT_DIRS = ('plugins', 'examples')
 EXCLUDE_DIR_NAMES = {'__pycache__', '.git', '.venv', 'venv', 'out', '.mypy_cache', '.ruff_cache'}
 EXCLUDE_SUFFIXES = ('.pyc', '.pyo', '.log', '.tmp', '.zip')
 
+#: 打包时统一规范为 LF 的文本文件类型（后缀或完整文件名）。
+#: 为什么需要：同一个提交在不同平台 checkout 到的工作区行尾可能不同（Windows 上 text=auto
+#: 的文件可能是 CRLF，Linux CI 上是 LF）；若原样打包，`--check` 会在 CI 与本地结果不一致。
+#: 这里统一 CRLF→LF 并去掉 UTF-8 BOM，保证「同一提交 → 同一 zip 字节」跨平台成立。
+TEXT_SUFFIXES = ('.py', '.md', '.txt', '.yaml', '.yml', '.json', '.mjs', '.js', '.css', '.html')
+TEXT_NAMES = {'LICENSE', 'README', 'NOTICE', 'CHANGELOG', 'AUTHORS'}
+
+
+def _normalize_text_bytes(arcname: str, data: bytes) -> bytes:
+    """把文本类条目的换行/BOM 规范化为跨平台稳定形式；二进制原样返回。"""
+    name = os.path.basename(arcname)
+    if name in TEXT_NAMES or name.lower().endswith(TEXT_SUFFIXES):
+        if data.startswith(b'\xef\xbb\xbf'):
+            data = data[3:]
+        return data.replace(b'\r\n', b'\n')
+    return data
+
 
 def _collect_dir(rel_dir: str) -> list:
     """递归收集仓库内某目录下的文件（相对仓库根的路径，posix 分隔，已排序）。"""
@@ -144,7 +161,7 @@ def build_bytes() -> bytes:
         zf.writestr(_zipinfo(TOP + '/'), b'')
         for arcname, path in entries:
             with open(path, 'rb') as fh:
-                zf.writestr(_zipinfo(arcname), fh.read())
+                zf.writestr(_zipinfo(arcname), _normalize_text_bytes(arcname, fh.read()))
     return buf.getvalue()
 
 

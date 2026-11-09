@@ -2,3 +2,11 @@
 *.py text eol=lf
 *.md text eol=lf
 *.txt text eol=lf
+
+# 行尾统一为 LF（zip 跨平台确定性；LICENSE/yaml/json 也纳入）
+*.yml text eol=lf
+*.yaml text eol=lf
+*.json text eol=lf
+*.mjs text eol=lf
+*.js text eol=lf
+LICENSE text eol=lf
