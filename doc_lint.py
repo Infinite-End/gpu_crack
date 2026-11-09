@@ -89,6 +89,17 @@ for script, subs in SCRIPTS.items():
         rc, out = run([os.path.join(ROOT, script), sub, '--help'])
         flags |= set(FLAG_RE.findall(out))
 flags.add('--help')
+
+# 追加扫描根目录脚本里直接声明的选项（consistency.py --fuzz、bench --markdown 等
+# 不在子命令 SCRIPTS 里的选项也要算作"真实存在"）
+import re as _re
+for _py in ('gpu_crack.py', 'ctf_tools.py', 'ctf_ext.py', 'ctf_misc.py', 'consistency.py'):
+    _p = os.path.join(ROOT, _py)
+    if os.path.exists(_p):
+        with open(_p, encoding='utf-8') as _fh:
+            for _opt in _re.findall(r"add_argument\(\s*['\"]--([\w-]+)", _fh.read()):
+                flags.add('--' + _opt)
+
 print('actual flags (%d)\n' % len(flags))
 
 # ---------- 2. 文档中的参数必须存在 ----------
@@ -145,7 +156,7 @@ for p in DOCS + [os.path.join(ROOT, f) for f in SCRIPTS] + [CTF]:
 
 # ---------- 7. 关键章节 ----------
 for p, text in doc_text.items():
-    check('has version header: ' + os.path.basename(p), ('v2.3' in text) or ('v2.2' in text) or ('v2.1' in text) or ('v1.0' in text))
+    check('has version header: ' + os.path.basename(p), ('v3.0' in text) or ('v2.3' in text) or ('v2.2' in text) or ('v2.1' in text) or ('v1.0' in text))
 for token in ('退出码矩阵', '稳定契约', '★', 'UTF-8'):
     check('CLI_REFERENCE contains ' + token, token in cli_ref)
 check('CLI_REFERENCE count 30', '30 个功能子命令' in cli_ref)

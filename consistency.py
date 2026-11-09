@@ -23,6 +23,7 @@ consistency.py — 跨模块 / 跨后端的独立一致性校验
 """
 from __future__ import annotations
 
+import argparse
 import hashlib
 import os
 import random
@@ -358,7 +359,42 @@ def test_misc_crypto():
 
 
 # ---------------------------------------------------------------- main
-def main():
+def test_fuzz(n):
+    """随机输入对拍：固定向量覆盖标准值，这里补边界（随机密钥长度 / 块 / nonce）。"""
+    from Crypto.Cipher import AES
+    rnd = random.Random(20261109)
+    for i in range(n):
+        klen = rnd.choice((16, 24, 32))
+        key = bytes(rnd.randrange(256) for _ in range(klen))
+        blk = bytes(rnd.randrange(256) for _ in range(16))
+        # 1) AES-ECB：numpy 后端 vs torch 后端
+        G.init_backend('numpy')
+        ref = G.from_dev(G.aes_ecb(np.frombuffer(blk, dtype=np.uint8)[None, :],
+                                   np.frombuffer(key, dtype=np.uint8))).tobytes()
+        G.init_backend('torch')
+        T = G.xp()
+        got = G.from_dev(G.aes_ecb(T.tensor(np.frombuffer(blk, dtype=np.uint8)[None, :],
+                                            device=G.DEV),
+                                   T.tensor(np.frombuffer(key, dtype=np.uint8),
+                                            device=G.DEV))).tobytes()
+        check(f'fuzz#{i} AES-{klen*8} torch↔numpy', ref == got, f'{ref.hex()} vs {got.hex()}')
+        # 2) AES-CTR（16B 整块计数器 / 大端）：vs pycryptodome
+        nonce16 = bytes(rnd.randrange(256) for _ in range(16))
+        ctr = rnd.randrange(1 << 16)
+        want = AES.new(key, AES.MODE_CTR, nonce=b'',
+                       initial_value=int.from_bytes(nonce16, 'big') + ctr).encrypt(bytes(64))
+        mine = TOOLS.aesctr_keystream(key, nonce16, 64, ctr, 'be')
+        check(f'fuzz#{i} AES-{klen*8}-CTR vs pycryptodome', mine == want,
+              f'{mine[:8].hex()} vs {want[:8].hex()}')
+    G.init_backend('auto')
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description='跨模块 / 跨后端 / vs 第三方库 一致性校验')
+    ap.add_argument('--fuzz', type=int, default=0, metavar='N',
+                    help='额外做 N 轮随机对拍（torch ↔ numpy ↔ pycryptodome），默认 0')
+    a = ap.parse_args(argv)
+    fuzz = a.fuzz
     print('=' * 60)
     print('跨模块 / 跨后端 / vs 第三方库 一致性校验')
     print('=' * 60)
@@ -371,6 +407,8 @@ def main():
     test_rs()
     test_lcg()
     test_misc_crypto()
+    if fuzz:
+        test_fuzz(fuzz)
 
     npass = sum(1 for _, ok, _ in RESULTS if ok)
     print('=' * 60)

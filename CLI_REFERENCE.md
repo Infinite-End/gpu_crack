@@ -2,7 +2,7 @@
 
 | 文档属性 | 值 |
 |---|---|
-| 文档版本 | v2.3（2026-11-09） |
+| 文档版本 | v3.0（2026-11-09） |
 | 适用工具 | gpu_crack toolkit v2（仓库根目录） |
 | 校验状态 | 与 `--help` 和各模块自测一致；验收套件 129/129 PASS |
 | 配套文档 | [README.md](README.md)（项目说明）、skill 的 `SKILL.md` / `references/kernels.md`（使用策略） |
@@ -40,12 +40,11 @@
 > 通过统一入口 `ctf.py` 调用时位置随意：`python ctf.py mtscan ... --backend numpy` 亦可。
 
 ### 0.3 子命令总表（30 个功能子命令 + 3 个模块自测）
-
 | # | 模块 | 子命令 | 一句话用途 |
 |---|---|---|---|
 | 1 | gpu_crack | `bench` | 测当前机器/后端吞吐 |
 | 2 | gpu_crack | `mtscan` | 暴力 mt19937 种子 → 24B 密钥匹配 |
-| 3 | gpu_crack | `sboxscan` | 枚举 AES-192 S-box 破坏 (a,b) |
+| 3 | gpu_crack | `sboxscan` | 枚举 AES-128/192/256 S-box 破坏 (a,b) |
 | 4 | gpu_crack | `ksscore` | 候选密钥流 vs 目标的比特一致度打分 |
 | 5 | gpu_crack | `lfsrscan` | 多条 LFSR 并行仿真匹配比特流 |
 | 6 | ctf_tools | `chacha` | ChaCha20 密钥流生成 / 候选密钥扫描 |
@@ -93,10 +92,10 @@ python ctf.py bench
 
 | 项 | 说明 |
 |---|---|
-| 输入 | 无 |
-| 输出 | `[backend] ...`、`[device ] ...`（torch 时）、`[popcount] ... M/s`、`[mt19937 ] ... K keys/s`、`[aes192  ] ... K blocks/s` |
+| 输入 | 无；可选 `--markdown` 以 Markdown 表格输出（写入 `docs/bench.md` 用） |
+| 输出 | `[backend] ...`、`[device ] ...`（torch 时）、`[popcount] ... M/s`、`[mt19937 ] ... K keys/s`、`[aes128/192/256] ... K blocks/s` |
 | 退出码 | 0 |
-| 备注 | 已内置 3 次预热以排除 JIT 编译，适合在正式搜索前先跑 |
+| 备注 | 已内置 3 次预热以排除 JIT 编译，适合在正式搜索前先跑；`--markdown` 时只输出表格 |
 
 ### 1.2 `mtscan` — mt19937 种子暴力匹配
 

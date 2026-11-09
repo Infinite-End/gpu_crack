@@ -1,0 +1,54 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.11', '3.12']
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies (CPU torch)
+        run: |
+          python -m pip install --upgrade pip
+          pip install --index-url https://download.pytorch.org/whl/cpu torch
+          pip install numpy pycryptodome cryptography pillow capstone pyelftools
+
+      - name: Docs consistency (params/flags/outputs/version)
+        run: python doc_lint.py
+
+      - name: Module self-tests
+        run: |
+          python gpu_crack.py --backend numpy bench
+          python ctf_tools.py --backend numpy selftest
+          python ctf_ext.py --backend numpy selftest
+          python ctf_misc.py selftest
+
+      - name: Cross-backend consistency (fixed vectors)
+        run: python consistency.py
+
+      - name: Cross-backend consistency (random fuzz)
+        run: python consistency.py --fuzz 25
+
+      - name: Dispatcher smoke test
+        run: |
+          python skill/scripts/ctf.py selftest
+          python skill/scripts/ctf.py --json --quiet mtscan --key-hex ffffff --seed-start 0 --seed-count 3000
+          python skill/scripts/ctf.py --json --quiet mdext --algo md5 --orig-len 3 \
+            --digest-hex 900150983cd24fb0d6963f7d28e17f72 --append-hex 00
+          python skill/scripts/ctf.py --quiet eccscan --curve secp256k1 \
+            --pub-hex 04000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000007 \
+            --start 0 --count 64 || true
+
+      - name: Examples generator
+        run: python examples/make_examples.py

@@ -1,4 +1,4 @@
-# gpu_crack — GPU 批量爆破 / 校验工具箱
+﻿# gpu_crack — GPU 批量爆破 / 校验工具箱
 
 > English: a GPU-accelerated CTF toolkit for batch brute-force and triage — MT19937 seed scan, AES S-box
 > fault scan, ChaCha20/RC4/AES-CTR keystream, RS(63,31), TEA/Speck, LCG recovery, MD5 cracking,
@@ -8,11 +8,11 @@
 
 | 文档属性 | 值 |
 |---|---|
-| 文档版本 | v2.3（2026-11-09） |
+| 文档版本 | v3.0（2026-11-09） |
 | 工具版本 | gpu_crack toolkit v2 |
 | 校验状态 | `ctf.py selftest` 全 PASS；`consistency.py` 32/32；`doc_lint.py` 文档一致性 35 项全 PASS |
 | 适用环境 | Windows + Python 3.15 + torch 2.14.1+cu130（无 torch 时自动回退 numpy） |
-| GitHub | https://github.com/Infinite-End/gpu_crack（**public / MIT**，tag `v2.3`） |
+| GitHub | https://github.com/Infinite-End/gpu_crack（**public / MIT**，tag `v3.0`） |
 | 配套文档 | [CLI_REFERENCE.md](CLI_REFERENCE.md)（**参数/输出/退出码以它为准**）、`skill/SKILL.md` 与 `skill/references/kernels.md` |
 | 许可证 | [MIT](LICENSE) |
 
@@ -247,11 +247,15 @@ ct = G.aes192_ecb(blocks, key_t, None, a_idx, b_val)          # blocks/key_t/a_i
 <仓库根>\
 ├─ gpu_crack.py       主框架（bench/mtscan/sboxscan/ksscore/lfsrscan + 批量内核库）
 ├─ ctf_tools.py       密码学内核（chacha/poly1305/rs63/crc32/xorbrute/aesctr）
-├─ ctf_ext.py         算法族（tea/speck/rc4/lcg/md5/rsa/encode）
+├─ ctf_ext.py         算法族（tea/speck/rc4/lcg/md5/rsa/encode/mdext/bm/zipbrute/eccscan）/ cf. ctf_common.py
+├─ ctf_common.py      共享调度（分块 + OOM 自动降档 + 进度 ETA + 断点续跑 + JSON 输出）
 ├─ ctf_misc.py        取证 & Pwn（lsb/stegscan/imgdiff/bitplane/cyclic/cycfind/gadgets/elfinfo）
 ├─ selftest.py        主框架自测（AES-192 NIST / mt19937 参考 / 植入-找回 / 性能）
-├─ consistency.py     跨实现一致性校验（32 项）
+├─ consistency.py     跨实现一致性校验（32 项固定向量 + `--fuzz N` 随机对拍）
 ├─ doc_lint.py        文档一致性检查（文档中的参数/模块/计数必须与真实 CLI 对齐）
+├─ docs/bench.md      本机吞吐基准（`bench --markdown` 生成，勿手改）
+├─ examples/          示例输入生成器 + 逐条跑法（examples/out/ 不入库）
+├─ .github/workflows/ci.yml  CI：文档校验 + 自测 + 对拍 + 冒烟 + 示例生成
 ├─ README.md          本文件（项目说明）
 ├─ CLI_REFERENCE.md   完整 CLI 参考（参数/输出/退出码/示例）
 ├─ requirements.txt    依赖清单（pip install -r requirements.txt）
@@ -265,6 +269,17 @@ ct = G.aes192_ecb(blocks, key_t, None, a_idx, b_val)          # blocks/key_t/a_i
 ```
 
 ## 12. 变更记录
+
+### v3.0（2026-11-09，本轮：工程化收尾）
+
+- **CI**：`.github/workflows/ci.yml`，Ubuntu + Python 3.11/3.12，跑 `doc_lint`、四个模块 selftest、
+  `consistency`（固定向量 + `--fuzz 25` 随机对拍）、统一入口冒烟、examples 生成。
+- **examples/**：`make_examples.py` 生成 6 组可跑通示例（mt19937 密钥流、Fermat RSA、ECC 小私钥、
+  LFSR 比特流、LSB PNG、假口令字典），`examples/README.md` 给出逐条命令；生成物 `examples/out/` 不入库。
+- **`bench --markdown`**：吞吐基准可直接输出 Markdown 表格，本机数据生成到 `docs/bench.md`
+  （新增 AES-128/256 行）。
+- **`consistency.py --fuzz N`**：随机密钥长度/随机块/随机 nonce 对拍（torch ↔ numpy ↔ pycryptodome），
+  默认 0 保持原有 32 项；`--fuzz 20` → 72/72。
 
 ### v2.3（2026-11-09，本轮：通用调度 + 4 个新内核）
 
@@ -310,7 +325,7 @@ ct = G.aes192_ecb(blocks, key_t, None, a_idx, b_val)          # blocks/key_t/a_i
 
 ## 13. GitHub 仓库与跨机使用
 
-- 仓库：https://github.com/Infinite-End/gpu_crack （**public / 开源**），标签 `v2.3`。
+- 仓库：https://github.com/Infinite-End/gpu_crack （**public / 开源**），标签 `v3.0`。
 - 仓库根目录 = 本目录。`skill/` 是 skill 定义（`SKILL.md` / `SKILL.en.md` / `references/kernels.md` / `scripts/ctf.py` / `agents/openai.yaml`）的**同步副本**；
   修改 skill 源后需同步到 `skill/`，`doc_lint.py` 会校验镜像一致性。
 - 在其它机器/其它模型上使用：

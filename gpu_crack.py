@@ -15,7 +15,7 @@ gpu_crack.py — 通用 GPU 批量爆破 / 校验框架（CTF toolkit 主框架�
 ------
   bench      基准测试（摸清本机吞吐，正式搜索前先跑）
   mtscan     暴力 mt19937 种子 → 24B 密钥，与目标密钥流前缀比对
-  sboxscan   AES-192 任意 S-box 候选批量加密，匹配指定明文/密文对
+  sboxscan   AES-128/192/256 任意 S-box 候选批量加密，匹配指定明文/密文对
   ksscore    候选密钥流 × 多样本 的比特一致度打分（统计淘汰）
   lfsrscan   多条 LFSR（抽头可不同）并行跑 N 拍，匹配目标比特流
 
@@ -430,41 +430,51 @@ def cmd_bench(a):
         if BACKEND.startswith("torch"):
             torch.cuda.synchronize()
 
+    md = bool(getattr(a, 'markdown', False))
+    rows = []
+
+    def _timed(fn, *args):
+        warm(fn, *args)
+        t0 = time.time()
+        fn(*args)
+        if BACKEND.startswith("torch"):
+            torch.cuda.synchronize()
+        return time.time() - t0
+
     # 1) popcount 吞吐
     n = 1 << 22
     x = (T.randint(0, 1 << 31, (n,), dtype=T.int64, device=DEV) if BACKEND.startswith("torch")
          else np.random.randint(0, 1 << 31, n, dtype=np.int64))
-    warm(popcount_matrix, x)
-    t0 = time.time(); popcount_matrix(x)
-    if BACKEND.startswith("torch"):
-        torch.cuda.synchronize()
-    dt = time.time() - t0
-    print(f"[popcount] {n/dt/1e6:.1f} M/s   ({dt*1e3:.0f} ms, {n} 个 32bit)")
+    dt = _timed(popcount_matrix, x)
+    rows.append(('popcount', f"{n/dt/1e6:.1f}", 'M 个/s', f'{n} 个 32bit', dt))
 
     # 2) mt19937 密钥生成
     m = 1 << 16
     s = (T.arange(m, dtype=T.int64, device=DEV) if BACKEND.startswith("torch")
          else np.arange(m, dtype=np.int64))
-    warm(mt19937_keys, s, False)
-    t0 = time.time(); mt19937_keys(s, False)
-    if BACKEND.startswith("torch"):
-        torch.cuda.synchronize()
-    dt = time.time() - t0
-    print(f"[mt19937 ] {m/dt/1e3:.1f} K keys/s  ({dt*1e3:.0f} ms, {m} 个种子)")
+    dt = _timed(mt19937_keys, s, False)
+    rows.append(('mt19937', f"{m/dt/1e3:.1f}", 'K keys/s', f'{m} 个种子', dt))
 
-    # 3) AES-192 单块批量
-    blk = (T.zeros((1 << 14, 16), dtype=T.uint8, device=DEV) if BACKEND.startswith("torch")
-           else np.zeros((1 << 14, 16), dtype=np.uint8))
-    k = (T.zeros((24,), dtype=T.uint8, device=DEV) if BACKEND.startswith("torch")
-         else np.zeros((24,), dtype=np.uint8))
-    ai = (T.full((blk.shape[0], 1), 0x42, dtype=T.uint8, device=DEV) if BACKEND.startswith("torch")
-          else np.full((blk.shape[0], 1), 0x42, dtype=np.uint8))
-    warm(aes192_ecb, blk, k, None, ai, ai)
-    t0 = time.time(); aes192_ecb(blk, k, None, ai, ai)
-    if BACKEND.startswith("torch"):
-        torch.cuda.synchronize()
-    dt = time.time() - t0
-    print(f"[aes192  ] {blk.shape[0]/dt/1e3:.1f} K blocks/s ({dt*1e3:.0f} ms, {blk.shape[0]} 块)")
+    # 3) AES-128/192/256 单块批量
+    for kl in (16, 24, 32):
+        blk = (T.zeros((1 << 14, 16), dtype=T.uint8, device=DEV) if BACKEND.startswith("torch")
+               else np.zeros((1 << 14, 16), dtype=np.uint8))
+        k = (T.zeros((kl,), dtype=T.uint8, device=DEV) if BACKEND.startswith("torch")
+             else np.zeros((kl,), dtype=np.uint8))
+        ai = (T.full((blk.shape[0], 1), 0x42, dtype=T.uint8, device=DEV) if BACKEND.startswith("torch")
+              else np.full((blk.shape[0], 1), 0x42, dtype=np.uint8))
+        dt = _timed(aes_ecb, blk, k, None, ai, ai)
+        rows.append((f'aes{kl * 8}', f"{blk.shape[0]/dt/1e3:.1f}", 'K blocks/s',
+                     f'{blk.shape[0]} 块', dt))
+
+    if md:
+        print('| 内核 | 吞吐 | 批量 | 耗时 |')
+        print('|---|---|---|---|')
+        for label, rate, unit, cnt, sec in rows:
+            print(f'| `{label}` | {rate} {unit} | {cnt} | {sec*1e3:.0f} ms |')
+    else:
+        for label, rate, unit, cnt, sec in rows:
+            print(f"[{label:<8}] {rate} {unit}  ({sec*1e3:.0f} ms, {cnt})")
 
 
 def cmd_mtscan(a):
@@ -698,7 +708,9 @@ def main():
     C.add_sched_args(ap)
     sub = ap.add_subparsers(dest="cmd", required=True, metavar="{bench,mtscan,sboxscan,ksscore,lfsrscan}")
 
-    sub.add_parser("bench", help="基准测试：当前机器/后端的吞吐（正式搜索前先跑）")
+    p = sub.add_parser("bench", help="基准测试：当前机器/后端的吞吐（正式搜索前先跑）")
+    p.add_argument("--markdown", action="store_true",
+                   help="输出 Markdown 表格（可直接写入 docs/bench.md）")
 
     p = sub.add_parser("mtscan", help="暴力 mt19937 种子 -> 24B 密钥，与目标比对")
     p.add_argument("--key-hex", required=True, help="目标密钥/密钥流前缀，裸 hex，1~24 字节")
