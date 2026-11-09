@@ -26,8 +26,9 @@ skill 运行时需要工具箱本体（`gpu_crack.py` 等），因此本脚本�
   python -X utf8 build_skill_zip.py --list       # 列出 zip 条目
   python -X utf8 build_skill_zip.py --output X.zip
 
-确定性：条目排序 + 固定时间戳 + 固定权限位，源文件不变时 zip 字节不变，
-因此适合入库并通过 `--check` 做漂移检查（改了 skill/ 或工具箱却忘了重建 zip 会 FAIL）。
+确定性：条目排序 + 固定时间戳 + 固定权限位 + 文本行尾统一为 LF，因此**同一解释器**下源文件
+不变时 zip 字节不变；`--check` 做**内容级**校验（条目名 + 解压后 sha256），不依赖具体 zlib
+压缩实现，可在 Windows/Ubuntu、Python 3.11~3.15 之间稳定判定「skill.zip 是否与源文件同步」。
 
 退出码：0 = 成功/同步；1 = `--check` 发现不同步或 zip 损坏；2 = 参数/源文件错误。
 """
@@ -186,23 +187,26 @@ def _new_entries(data: bytes) -> dict:
 
 
 def check(zip_path: str) -> int:
+    """校验 zip 与源文件**内容**同步（条目名 + 解压后 sha256）。
+
+    注意这里刻意不比较 zip 的原始字节：不同 Python 版本/平台的 zlib 压缩实现可能产生
+    不同的 deflate 流（同内容不同字节），CI（Ubuntu Python 3.11/3.12）与本机（Windows
+    Python 3.15）因此会误报。内容级校验与压缩实现无关，跨平台/跨版本都稳定；
+    同一解释器下 `--write` 仍然是字节确定性的（固定时间戳/排序/权限）。
+    """
     if not os.path.isfile(zip_path):
         print(f'FAIL  {zip_path} 不存在；先运行: python -X utf8 build_skill_zip.py')
         return 1
-    new_data = build_bytes()
-    with open(zip_path, 'rb') as fh:
-        old_data = fh.read()
-    if new_data == old_data:
-        print(f'PASS  {os.path.basename(zip_path)} 与源文件同步 '
-              f'({len(new_data):,} 字节, {len(_new_entries(new_data)) - 1} 个文件)')
-        return 0
-    # 字节不同 -> 给出逐文件差异，便于定位
     try:
         old = _zip_entries(zip_path)
     except (ValueError, zipfile.BadZipFile) as exc:
         print(f'FAIL  {zip_path} 损坏: {exc}')
         return 1
-    new = _new_entries(new_data)
+    new = _new_entries(build_bytes())
+    if old == new:
+        print(f'PASS  {os.path.basename(zip_path)} 与源文件内容同步 '
+              f'({len(new) - (1 if TOP + "/" in new else 0)} 个文件)')
+        return 0
     missing = sorted(set(new) - set(old))
     extra = sorted(set(old) - set(new))
     changed = sorted(n for n in set(new) & set(old) if new[n] != old[n])
